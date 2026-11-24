@@ -21,7 +21,14 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import yaml
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 MICRO_PER_USD = 1_000_000
@@ -142,6 +149,17 @@ class Settings(BaseSettings):
     budgets: Budgets = Field(default_factory=Budgets)
     loop: LoopConfig = Field(default_factory=LoopConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
+    # A run's budget key lives this long after its last reserve.
+    run_ttl_seconds: int = Field(default=7 * 86_400, gt=0)
+    # An unsettled reservation is dropped after this long (its amount stays reserved
+    # until the M2c sweeper). Must outlast the longest call, including long streams.
+    reservation_ttl_seconds: int = Field(default=3_600, gt=0)
+
+    @model_validator(mode="after")
+    def _reservation_outlives_calls(self) -> Settings:
+        if self.reservation_ttl_seconds <= self.upstream_timeout_seconds:
+            raise ValueError("reservation_ttl_seconds must exceed upstream_timeout_seconds")
+        return self
 
     @classmethod
     def settings_customise_sources(

@@ -10,6 +10,7 @@ underestimating could let a run overspend).
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
@@ -145,6 +146,34 @@ def estimate_input_tokens(
     ) + count_tool_tokens(model, body.get("tools"))
 
 
+def count_text_tokens(model: str, text: str) -> int:
+    """Tokens in a piece of generated text (used to settle a stream that lost its usage)."""
+    return len(encoding_for(model).encode(text)) if text else 0
+
+
+@dataclass(frozen=True, slots=True)
+class Estimate:
+    input_tokens: int
+    max_output_tokens: int  # max output per choice × n
+    micro: int  # worst-case cost, micro-USD
+
+
+def estimate(
+    prices: PriceTable,
+    model: str,
+    body: dict[str, Any],
+    default_max_tokens: int,
+    image_part_tokens: int = DEFAULT_IMAGE_PART_TOKENS,
+) -> Estimate:
+    """Worst-case token counts and cost. Raises UnknownModel or EstimateError."""
+    prices.lookup(model)  # fail fast on unknown models, before tokenizing
+    input_tokens = estimate_input_tokens(model, body, image_part_tokens)
+    output_tokens = effective_max_output(body, default_max_tokens) * choice_count(body)
+    return Estimate(
+        input_tokens, output_tokens, prices.cost_micro(model, input_tokens, output_tokens)
+    )
+
+
 def estimate_micro(
     prices: PriceTable,
     model: str,
@@ -153,7 +182,4 @@ def estimate_micro(
     image_part_tokens: int = DEFAULT_IMAGE_PART_TOKENS,
 ) -> int:
     """Worst-case cost in micro-USD. Raises UnknownModel or EstimateError."""
-    prices.lookup(model)  # fail fast on unknown models, before tokenizing
-    input_tokens = estimate_input_tokens(model, body, image_part_tokens)
-    output_tokens = effective_max_output(body, default_max_tokens) * choice_count(body)
-    return prices.cost_micro(model, input_tokens, output_tokens)
+    return estimate(prices, model, body, default_max_tokens, image_part_tokens).micro

@@ -10,6 +10,8 @@ from app.proxy import upstream_request_headers
 from mock_upstream.main import app as mock_app
 from tests.conftest import make_settings
 
+pytestmark = pytest.mark.usefixtures("redis_db")
+
 UPSTREAM = "http://mock_upstream/v1"
 REQUEST = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
 

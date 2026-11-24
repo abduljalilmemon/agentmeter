@@ -19,7 +19,7 @@ jobs:
           --health-timeout 2s
           --health-retries 15
     env:
-      AGENTMETER_TEST_REDIS_URL: redis://localhost:6379/0
+      AGENTMETER_TEST_REDIS_URL: redis://localhost:6379/15
       AGENTMETER_REQUIRE_REDIS: "1"
       TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.tiktoken-cache
     steps:

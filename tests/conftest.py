@@ -1,13 +1,29 @@
 import os
+import socket
+import threading
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+import redis
+import uvicorn
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_CONFIG = REPO_ROOT / "agentmeter.yaml"
 
 # Test-harness knobs; not settings fields, so they survive the env scrub below.
 _TEST_KNOBS = {"AGENTMETER_TEST_REDIS_URL", "AGENTMETER_REQUIRE_REDIS"}
+
+# Tests own this Redis database and FLUSHDB it before each test that uses it.
+TEST_REDIS_URL = os.environ.get("AGENTMETER_TEST_REDIS_URL", "redis://localhost:6379/15")
+REQUIRE_REDIS = os.environ.get("AGENTMETER_REQUIRE_REDIS") == "1"
+NO_REDIS = "redis://127.0.0.1:1/0"  # nothing listens on port 1
+
+TEST_PRICING = {
+    "gpt-4o-mini": {"input": "0.15", "output": "0.60"},
+    "gemini-2.5-flash": {"input": "0.30", "output": "2.50"},
+}
 
 
 @pytest.fixture(autouse=True)
@@ -18,17 +34,56 @@ def _clean_agentmeter_env(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(name)
 
 
-NO_REDIS = "redis://127.0.0.1:1/0"
-TEST_PRICING = {
-    "gpt-4o-mini": {"input": "0.15", "output": "0.60"},
-    "gemini-2.5-flash": {"input": "0.30", "output": "2.50"},
-}
+def redis_reachable(url: str = TEST_REDIS_URL) -> bool:
+    try:
+        return bool(redis.Redis.from_url(url, socket_connect_timeout=0.5).ping())
+    except (redis.RedisError, OSError):
+        return False
+
+
+@pytest.fixture
+def redis_db() -> redis.Redis:
+    """A clean test database (sync client for assertions). Skips if Redis is not running,
+    fails instead when AGENTMETER_REQUIRE_REDIS=1 (CI)."""
+    if not redis_reachable():
+        if REQUIRE_REDIS:
+            pytest.fail(f"Redis required but not reachable at {TEST_REDIS_URL}")
+        pytest.skip("Redis not running (docker compose up -d redis)")
+    client = redis.Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+    client.flushdb()
+    return client
 
 
 def make_settings(upstream: str = "http://mock_upstream/v1", **kw: object):
-    """Settings for proxy tests: priced models, no Redis."""
+    """Settings for proxy tests: priced models, the test Redis database."""
     from app.config import Settings
 
-    kw.setdefault("redis_url", NO_REDIS)
+    kw.setdefault("redis_url", TEST_REDIS_URL)
     kw.setdefault("pricing", TEST_PRICING)
     return Settings(upstream=upstream, **kw)
+
+
+@pytest.fixture(scope="session")
+def live_mock() -> Iterator[str]:
+    """mock_upstream on a real socket, so a cut stream is a real dropped connection."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = uvicorn.Server(
+        uvicorn.Config(_mock_app(), host="127.0.0.1", port=port, log_level="critical")
+    )
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started:
+        assert time.monotonic() < deadline, "mock_upstream did not start"
+        time.sleep(0.02)
+    yield f"http://127.0.0.1:{port}/v1"
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+def _mock_app():
+    from mock_upstream.main import app
+
+    return app

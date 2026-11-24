@@ -1,21 +1,20 @@
 import json
-import socket
-import threading
-import time
 from collections.abc import AsyncIterator, Iterator
 
 import anyio
 import httpx
 import pytest
-import uvicorn
 from fastapi.testclient import TestClient
 from openai import APIError, OpenAI
 from starlette.requests import ClientDisconnect
 
 from app import proxy
-from app.main import CallContext, create_app
+from app.chat import CallContext
+from app.main import create_app
 from mock_upstream.main import app as mock_app
 from tests.conftest import make_settings
+
+pytestmark = pytest.mark.usefixtures("redis_db")
 
 REQUEST = {
     "model": "gpt-4o-mini",
@@ -58,26 +57,6 @@ def client(recorder: Recorder) -> Iterator[TestClient]:
     )
     with TestClient(app) as c:
         yield c
-
-
-@pytest.fixture(scope="module")
-def live_mock() -> Iterator[str]:
-    """mock_upstream on a real socket, so a cut stream is a real dropped connection."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    server = uvicorn.Server(
-        uvicorn.Config(mock_app, host="127.0.0.1", port=port, log_level="critical")
-    )
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 10
-    while not server.started:
-        assert time.monotonic() < deadline, "mock_upstream did not start"
-        time.sleep(0.02)
-    yield f"http://127.0.0.1:{port}/v1"
-    server.should_exit = True
-    thread.join(timeout=5)
 
 
 def _last_upstream_body() -> dict:
@@ -179,8 +158,8 @@ def test_stream_cut_sdk_raises_api_error(live_mock: str, monkeypatch: pytest.Mon
     assert excinfo.value.body["type"] == "agentmeter_upstream_cut"
 
 
-def test_stream_cut_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
-    # ASGITransport can't drop a socket; the stream simply ends early.
+def test_stream_clean_end_without_done_is_cut(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ASGITransport can't drop a socket; the stream ends cleanly but without [DONE].
     monkeypatch.setenv("MOCK_STREAM_CUT", "1")
     app = create_app(
         make_settings(),
@@ -190,8 +169,11 @@ def test_stream_cut_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
     with TestClient(app) as c:
         resp = c.post("/v1/chat/completions", json=REQUEST)
     assert resp.status_code == 200
-    assert "[DONE]" not in resp.text
+    assert "data: [DONE]" not in resp.text
+    error = json.loads(_sse_events(resp.text)[-1])["error"]
+    assert (error["type"], error["code"]) == ("agentmeter_upstream_cut", "upstream_incomplete")
     assert rec.last.usage is None and not rec.last.done
+    assert rec.last.error == "incomplete"
 
 
 class ScriptedStream(httpx.AsyncByteStream):
@@ -276,7 +258,9 @@ async def test_client_disconnect_closes_upstream(spec_version: str) -> None:
         rec.append(result)
 
     async with httpx.AsyncClient(transport=_sse_upstream(stream)) as http:
-        response = await proxy.forward_stream(http, "http://up/v1", REQUEST, [], None, on_finish)
+        forwarded = await proxy.forward_stream(http, "http://up/v1", REQUEST, [], None, on_finish)
+    response = forwarded.response
+    assert forwarded.outcome is proxy.Outcome.STREAMING
     assert isinstance(response, proxy.UpstreamStreamingResponse)
 
     bodies = 0
