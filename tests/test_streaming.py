@@ -9,21 +9,20 @@ import httpx
 import pytest
 import uvicorn
 from fastapi.testclient import TestClient
-from openai import OpenAI
+from openai import APIError, OpenAI
 from starlette.requests import ClientDisconnect
 
 from app import proxy
-from app.config import Settings
-from app.identity import Identity
-from app.main import create_app
+from app.main import CallContext, create_app
 from mock_upstream.main import app as mock_app
+from tests.conftest import make_settings
 
 REQUEST = {
     "model": "gpt-4o-mini",
     "messages": [{"role": "user", "content": "hi"}],
     "stream": True,
 }
-NO_REDIS = "redis://127.0.0.1:1/0"
+
 USAGE = {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
 
 
@@ -32,8 +31,10 @@ class Recorder:
 
     def __init__(self) -> None:
         self.results: list[proxy.StreamResult] = []
+        self.contexts: list[CallContext] = []
 
-    async def __call__(self, identity: Identity, result: proxy.StreamResult) -> None:
+    async def __call__(self, ctx: CallContext, result: proxy.StreamResult) -> None:
+        self.contexts.append(ctx)
         self.results.append(result)
 
     @property
@@ -51,7 +52,7 @@ def recorder() -> Recorder:
 def client(recorder: Recorder) -> Iterator[TestClient]:
     """Proxy wired to the in-process mock upstream."""
     app = create_app(
-        Settings(upstream="http://mock_upstream/v1", redis_url=NO_REDIS),
+        make_settings(),
         upstream_transport=httpx.ASGITransport(app=mock_app),
         on_stream_finish=recorder,
     )
@@ -145,13 +146,16 @@ def test_stream_upstream_4xx_returns_json(
 def test_stream_cut_real_socket(live_mock: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MOCK_STREAM_CUT", "1")
     recorder = Recorder()
-    app = create_app(Settings(upstream=live_mock, redis_url=NO_REDIS), on_stream_finish=recorder)
+    app = create_app(make_settings(live_mock), on_stream_finish=recorder)
     with TestClient(app) as c:
         resp = c.post("/v1/chat/completions", json=REQUEST)
         assert resp.status_code == 200
         events = _sse_events(resp.text)
         assert events and "[DONE]" not in events
-        assert all(json.loads(e).get("usage") is None for e in events)
+        *content, last = (json.loads(e) for e in events)
+        assert all(e.get("usage") is None for e in content)
+        assert last["error"]["type"] == "agentmeter_upstream_cut"
+        assert last["error"]["code"] == "upstream_cut"
         assert recorder.last.usage is None
         assert not recorder.last.done
         assert recorder.last.error == "RemoteProtocolError"
@@ -160,11 +164,26 @@ def test_stream_cut_real_socket(live_mock: str, monkeypatch: pytest.MonkeyPatch)
         assert _sse_events(c.post("/v1/chat/completions", json=REQUEST).text)[-1] == "[DONE]"
 
 
+def test_stream_cut_sdk_raises_api_error(live_mock: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOCK_STREAM_CUT", "1")
+    with TestClient(create_app(make_settings(live_mock))) as c:
+        sdk = OpenAI(base_url="http://testserver/v1", api_key="sk-test", http_client=c)
+        stream = sdk.chat.completions.create(
+            model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}], stream=True
+        )
+        seen = []
+        with pytest.raises(APIError) as excinfo:
+            for chunk in stream:
+                seen.extend(ch.delta.content or "" for ch in chunk.choices)
+    assert "".join(seen) == "Hello from mock_upstream."  # content before the cut arrived
+    assert excinfo.value.body["type"] == "agentmeter_upstream_cut"
+
+
 def test_stream_cut_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
     # ASGITransport can't drop a socket; the stream simply ends early.
     monkeypatch.setenv("MOCK_STREAM_CUT", "1")
     app = create_app(
-        Settings(upstream="http://mock_upstream/v1", redis_url=NO_REDIS),
+        make_settings(),
         upstream_transport=httpx.ASGITransport(app=mock_app, raise_app_exceptions=False),
         on_stream_finish=(rec := Recorder()),
     )
@@ -207,16 +226,31 @@ def test_mid_stream_read_timeout_ends_stream() -> None:
     stream = ScriptedStream([first], fail=httpx.ReadTimeout("slow"))
     rec = Recorder()
     app = create_app(
-        Settings(upstream="http://up/v1", redis_url=NO_REDIS),
+        make_settings("http://up/v1"),
         upstream_transport=_sse_upstream(stream),
         on_stream_finish=rec,
     )
     with TestClient(app) as c:
         resp = c.post("/v1/chat/completions", json=REQUEST)
     assert resp.status_code == 200
-    assert resp.content == first
+    events = _sse_events(resp.text)
+    assert resp.content.startswith(first)  # what arrived before the timeout is kept
+    assert json.loads(events[-1])["error"]["code"] == "upstream_timeout"
     assert rec.last.error == "ReadTimeout"
     assert stream.closed
+
+
+def test_cut_mid_event_drops_fragment() -> None:
+    """A half-sent event is dropped so the error event is the only thing after it."""
+    whole = b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+    stream = ScriptedStream([whole, b'data: {"choi'], fail=httpx.RemoteProtocolError("cut"))
+    app = create_app(make_settings("http://up/v1"), upstream_transport=_sse_upstream(stream))
+    with TestClient(app) as c:
+        resp = c.post("/v1/chat/completions", json=REQUEST)
+    assert resp.content.startswith(whole)
+    tail = resp.content[len(whole) :]
+    assert tail.startswith(b"data: ") and tail.endswith(b"\n\n")
+    assert json.loads(tail[6:])["error"]["type"] == "agentmeter_upstream_cut"
 
 
 def test_stream_connect_timeout_502() -> None:
@@ -224,7 +258,7 @@ def test_stream_connect_timeout_502() -> None:
         raise httpx.ConnectTimeout("no route", request=request)
 
     app = create_app(
-        Settings(upstream="http://up/v1", redis_url=NO_REDIS),
+        make_settings("http://up/v1"),
         upstream_transport=httpx.MockTransport(handler),
     )
     with TestClient(app) as c:
@@ -272,11 +306,43 @@ async def test_client_disconnect_closes_upstream(spec_version: str) -> None:
     assert len(rec) == 1 and rec[0].client_disconnected and rec[0].usage is None
 
 
-def test_sse_parser_handles_split_lines() -> None:
+def test_sse_relay_handles_split_lines() -> None:
     result = proxy.StreamResult()
-    parser = proxy.SSEUsageParser(result)
+    relay = proxy.SSERelay(result)
     data = b'data: {"choices":[],"usage":{"total_tokens":3}}\r\n\r\ndata: [DONE]\n\n'
-    for i in range(len(data)):  # one byte at a time
-        parser.feed(data[i : i + 1])
+    out = b"".join(relay.feed(data[i : i + 1]) for i in range(len(data)))  # byte by byte
+    assert out + relay.flush() == data  # relayed unchanged
     assert result.usage == {"total_tokens": 3}
     assert result.done
+
+
+def test_sse_relay_emits_whole_events_only() -> None:
+    relay = proxy.SSERelay(proxy.StreamResult())
+    assert relay.feed(b"data: 1\n\ndata: 2") == b"data: 1\n\n"
+    assert relay.feed(b"\n") == b""
+    assert relay.feed(b"\n") == b"data: 2\n\n"
+
+
+def test_sse_relay_ignores_usage_in_unfinished_event() -> None:
+    result = proxy.StreamResult()
+    relay = proxy.SSERelay(result)
+    relay.feed(b'data: {"usage":{"total_tokens":9}}\n')  # no blank line yet
+    assert relay.discard() > 0
+    assert result.usage is None
+
+
+def test_sse_relay_bounds_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(proxy, "MAX_SSE_EVENT_BYTES", 16)
+    relay = proxy.SSERelay(proxy.StreamResult())
+    big = b"data: " + b"x" * 40
+    assert relay.feed(big) == big  # passed through instead of held back
+    assert relay.feed(b"\n\n") == b"\n\n"
+
+
+def test_stream_estimate_covers_actual(client: TestClient, recorder: Recorder) -> None:
+    client.post("/v1/chat/completions", json=REQUEST)
+    ctx, result = recorder.contexts[0], recorder.last
+    actual = ctx.actual_micro(result.usage)
+    assert actual == 14  # 10 in, 20 out on gpt-4o-mini
+    assert ctx.estimate_micro >= actual
+    assert _last_upstream_body()["max_tokens"] == 1024

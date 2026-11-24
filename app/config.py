@@ -112,6 +112,8 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     upstream_timeout_seconds: float = Field(default=600.0, gt=0)
     default_max_tokens: int = Field(default=1024, ge=1)
+    # Fixed token count per image part in the input estimate (placeholder, see estimate.py).
+    image_part_tokens: int = Field(default=1105, ge=0)
     pricing: dict[str, ModelPrice] = Field(default_factory=dict)
     budgets: Budgets = Field(default_factory=Budgets)
     loop: LoopConfig = Field(default_factory=LoopConfig)

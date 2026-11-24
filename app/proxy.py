@@ -34,8 +34,8 @@ _REQUEST_DROP = HOP_BY_HOP | {"host", "content-length", "accept-encoding"}
 # httpx decodes the body, so the upstream's encoding/length no longer apply.
 _RESPONSE_DROP = HOP_BY_HOP | {"content-length", "content-encoding"}
 
-# The SSE parser holds at most one partial line; longer lines are skipped, not buffered.
-MAX_SSE_LINE_BYTES = 1 << 20
+# The SSE relay holds back at most one partial event; larger events pass through unparsed.
+MAX_SSE_EVENT_BYTES = 1 << 20
 
 
 def _filter(headers: Iterable[tuple[str, str]], drop: frozenset[str]) -> list[tuple[str, str]]:
@@ -122,38 +122,92 @@ class StreamResult:
 StreamFinish = Callable[[StreamResult], Awaitable[None]]
 
 
-class SSEUsageParser:
-    """Incremental SSE scan that keeps only the last ``usage`` object and [DONE]."""
+class SSERelay:
+    """Incremental SSE scanner that relays whole events only.
+
+    ``feed`` returns the bytes of every event completed so far (unchanged), holding back a
+    partial event. That keeps the client stream event-aligned, so if the upstream breaks off
+    mid-event we can drop the fragment and append a clean error event. ``usage`` and
+    ``[DONE]`` are only recorded from completed events. Memory is bounded: an event larger
+    than MAX_SSE_EVENT_BYTES is passed through as-is and not parsed.
+    """
 
     def __init__(self, result: StreamResult) -> None:
         self._result = result
-        self._buf = b""
-        self._skipping = False  # inside an over-long line
+        self._line_buf = b""  # partial line
+        self._event = bytearray()  # complete lines of the current, unfinished event
+        self._usage: dict[str, Any] | None = None
+        self._done = False
+        self._oversized = False
 
-    def feed(self, chunk: bytes) -> None:
-        *lines, rest = (self._buf + chunk).split(b"\n")
+    def feed(self, chunk: bytes) -> bytes:
+        out = bytearray()
+        *lines, self._line_buf = (self._line_buf + chunk).split(b"\n")
         for line in lines:
-            if self._skipping:
-                self._skipping = False
-                continue
-            self._line(line.rstrip(b"\r"))
-        if len(rest) > MAX_SSE_LINE_BYTES:
-            self._skipping, rest = True, b""
-        self._buf = rest
+            self._event += line + b"\n"
+            stripped = line.rstrip(b"\r")
+            if stripped == b"":
+                out += self._complete_event()
+            elif not self._oversized:
+                self._line(stripped)
+        if len(self._event) + len(self._line_buf) > MAX_SSE_EVENT_BYTES:
+            # Give up holding this event back; relay it raw and skip parsing it.
+            out += self._event + self._line_buf
+            self._event.clear()
+            self._line_buf = b""
+            self._oversized = True
+            self._usage, self._done = None, False
+        return bytes(out)
+
+    def flush(self) -> bytes:
+        """Upstream ended normally: relay whatever is left, even without a final blank line."""
+        rest = bytes(self._event) + self._line_buf
+        if not self._oversized:
+            self._commit()
+        self._event.clear()
+        self._line_buf = b""
+        return rest
+
+    def discard(self) -> int:
+        """Upstream broke off: drop the incomplete event. Returns the bytes dropped."""
+        dropped = len(self._event) + len(self._line_buf)
+        self._event.clear()
+        self._line_buf = b""
+        return dropped
+
+    def _complete_event(self) -> bytes:
+        if not self._oversized:
+            self._commit()
+        self._oversized = False
+        event = bytes(self._event)
+        self._event.clear()
+        return event
+
+    def _commit(self) -> None:
+        if self._usage is not None:
+            self._result.usage = self._usage
+        if self._done:
+            self._result.done = True
+        self._usage, self._done = None, False
 
     def _line(self, line: bytes) -> None:
         if not line.startswith(b"data:"):
             return
         payload = line[5:].strip()
         if payload == b"[DONE]":
-            self._result.done = True
+            self._done = True
             return
         try:
             event = json.loads(payload)
         except ValueError:
             return
         if isinstance(event, dict) and isinstance(event.get("usage"), dict):
-            self._result.usage = event["usage"]
+            self._usage = event["usage"]
+
+
+def sse_error_event(message: str, err_type: str, code: str | None) -> bytes:
+    body = {"error": {"message": message, "type": err_type, "param": None, "code": code}}
+    return b"data: " + json.dumps(body).encode() + b"\n\n"
 
 
 def with_include_usage(body: dict[str, Any]) -> dict[str, Any]:
@@ -183,16 +237,26 @@ class UpstreamStreamingResponse(StreamingResponse):
         _relay_headers(self, upstream)
 
     async def _relay(self) -> AsyncIterator[bytes]:
-        parser = SSEUsageParser(self._result)
+        relay = SSERelay(self._result)
         try:
             async for chunk in self._upstream.aiter_bytes():
-                parser.feed(chunk)
-                self._result.bytes_relayed += len(chunk)
-                yield chunk
+                out = relay.feed(chunk)
+                if out:
+                    self._result.bytes_relayed += len(out)
+                    yield out
+            if rest := relay.flush():
+                self._result.bytes_relayed += len(rest)
+                yield rest
         except httpx.TransportError as exc:
-            # Headers are already sent, so the only option is to end the stream.
+            # Headers are already sent: drop the partial event, tell the client, end.
             self._result.error = type(exc).__name__
-            log.warning("upstream stream broke off: %r", exc)
+            dropped = relay.discard()
+            log.warning("upstream stream broke off (%d partial bytes dropped): %r", dropped, exc)
+            yield sse_error_event(
+                f"Upstream stream ended unexpectedly: {type(exc).__name__}",
+                "agentmeter_upstream_cut",
+                "upstream_timeout" if isinstance(exc, httpx.TimeoutException) else "upstream_cut",
+            )
         self._relay_ended = True
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

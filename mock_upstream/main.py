@@ -66,9 +66,10 @@ async def last_request() -> dict[str, Any]:
 
 @app.post("/v1/chat/completions", response_model=None)
 async def chat_completions(request: Request) -> dict[str, Any] | JSONResponse | StreamingResponse:
-    body = await request.json()
+    raw = await request.body()
+    body = json.loads(raw)
     _last_request.clear()
-    _last_request.update({"headers": dict(request.headers), "body": body})
+    _last_request.update({"headers": dict(request.headers), "body": body, "raw": raw.decode()})
 
     forced = os.environ.get("MOCK_FORCE_STATUS")
     if forced:

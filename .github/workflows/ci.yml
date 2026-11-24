@@ -21,12 +21,17 @@ jobs:
     env:
       AGENTMETER_TEST_REDIS_URL: redis://localhost:6379/0
       AGENTMETER_REQUIRE_REDIS: "1"
+      TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.tiktoken-cache
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
+      - uses: actions/cache@v4
+        with:
+          path: .tiktoken-cache
+          key: tiktoken-o200k-cl100k-v1
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .

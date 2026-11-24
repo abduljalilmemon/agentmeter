@@ -5,17 +5,17 @@ import pytest
 from fastapi.testclient import TestClient
 from openai import OpenAI
 
-from app.config import Settings
 from app.main import create_app
 from app.proxy import upstream_request_headers
 from mock_upstream.main import app as mock_app
+from tests.conftest import make_settings
 
 UPSTREAM = "http://mock_upstream/v1"
 REQUEST = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
 
 
-def _settings(**kw: object) -> Settings:
-    return Settings(upstream=UPSTREAM, redis_url="redis://127.0.0.1:1/0", **kw)
+def _settings(**kw: object):
+    return make_settings(UPSTREAM, **kw)
 
 
 @pytest.fixture
@@ -73,7 +73,7 @@ def test_am_headers_not_forwarded(client: TestClient) -> None:
     assert not [h for h in seen["headers"] if h.startswith("x-am-")]
     assert seen["headers"]["authorization"] == "Bearer sk-abc"
     assert seen["headers"]["x-custom"] == "kept"
-    assert seen["body"] == REQUEST
+    assert seen["body"] == {**REQUEST, "max_tokens": 1024}  # default injected
 
 
 def test_hop_by_hop_headers_dropped() -> None:
@@ -125,7 +125,7 @@ def test_upstream_timeout_returns_504() -> None:
 
 def test_connection_refused_returns_502() -> None:
     # Real socket: nothing listens on port 1.
-    app = create_app(Settings(upstream="http://127.0.0.1:1/v1", redis_url="redis://127.0.0.1:1/0"))
+    app = create_app(make_settings("http://127.0.0.1:1/v1"))
     with TestClient(app) as c:
         resp = c.post("/v1/chat/completions", json=REQUEST)
     assert resp.status_code == 502
@@ -145,3 +145,50 @@ def test_connect_timeout_returns_502() -> None:
 def test_invalid_json_returns_400(client: TestClient) -> None:
     resp = client.post("/v1/chat/completions", content=b"{nope", headers={"content-type": "x"})
     assert resp.status_code == 400
+
+
+def test_max_tokens_injected_when_missing(client: TestClient) -> None:
+    client.post("/v1/chat/completions", json=REQUEST)
+    assert _last_upstream_request()["body"]["max_tokens"] == 1024
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"max_tokens": 77},
+        {"max_completion_tokens": 88},
+        {"max_tokens": 5, "max_completion_tokens": 9},
+    ],
+)
+def test_client_limits_kept(client: TestClient, limits: dict) -> None:
+    client.post("/v1/chat/completions", json={**REQUEST, **limits})
+    body = _last_upstream_request()["body"]
+    assert {k: body.get(k) for k in limits} == limits
+    if "max_tokens" not in limits:
+        assert "max_tokens" not in body  # no injection next to max_completion_tokens
+
+
+def test_client_body_forwarded_byte_for_byte_when_unchanged(client: TestClient) -> None:
+    raw = (
+        b'{"messages": [{"role": "user", "content": "hi"}],'
+        b'   "model": "gpt-4o-mini", "max_tokens": 9}'
+    )
+    client.post("/v1/chat/completions", content=raw, headers={"content-type": "application/json"})
+    assert _last_upstream_request()["raw"] == raw.decode()
+
+
+def test_unknown_model_fails_closed(client: TestClient) -> None:
+    resp = client.post("/v1/chat/completions", json={**REQUEST, "model": "mystery-1"})
+    assert resp.status_code == 400
+    assert resp.json()["error"]["type"] == "agentmeter_unknown_model"
+    assert "x-am-run-id" in resp.headers
+
+
+def test_dated_model_priced_by_prefix(client: TestClient) -> None:
+    resp = client.post("/v1/chat/completions", json={**REQUEST, "model": "gpt-4o-mini-2024-07-18"})
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize("body", [{"messages": []}, {**REQUEST, "max_tokens": -5}])
+def test_bad_body_400(client: TestClient, body: dict) -> None:
+    assert client.post("/v1/chat/completions", json=body).status_code == 400
