@@ -1,0 +1,36 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  mock_upstream:
+    build:
+      context: .
+      dockerfile: mock_upstream/Dockerfile
+    ports:
+      - "8001:8000"
+    environment:
+      MOCK_PROMPT_TOKENS: ${MOCK_PROMPT_TOKENS:-10}
+      MOCK_COMPLETION_TOKENS: ${MOCK_COMPLETION_TOKENS:-20}
+
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      AGENTMETER_REDIS_URL: redis://redis:6379/0
+      AGENTMETER_UPSTREAM: http://mock_upstream:8000/v1
+      ALERT_WEBHOOK: ${ALERT_WEBHOOK:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock_upstream:
+        condition: service_started

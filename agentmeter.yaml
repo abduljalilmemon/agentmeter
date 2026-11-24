@@ -1,0 +1,20 @@
+# agentmeter.yaml
+# Money values are written in USD here and converted to integer micro-USD on load.
+# Prices are placeholders: check them against the providers' price pages before the demo.
+upstream: https://api.openai.com/v1
+default_max_tokens: 1024
+pricing:            # USD per 1M tokens
+  gpt-4o-mini: {input: 0.15, output: 0.60}
+  gemini-2.5-flash: {input: 0.30, output: 2.50}
+budgets:
+  default_run_usd: 0.50
+  agents:
+    support-bot: {daily_usd: 20}
+  teams:
+    platform: {monthly_usd: 500}
+loop:
+  repeat_threshold: 3
+  step_cap: 50
+alerts:
+  thresholds: [0.5, 0.75, 0.9]
+  webhook_url: ${ALERT_WEBHOOK}
