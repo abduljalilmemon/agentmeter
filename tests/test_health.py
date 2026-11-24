@@ -22,8 +22,8 @@ def test_healthz_redis_down() -> None:
     # Port 1 is never a Redis server: connection is refused immediately.
     with TestClient(create_app(Settings(redis_url="redis://127.0.0.1:1/0"))) as client:
         resp = client.get("/healthz")
-    assert resp.status_code == 200
-    assert resp.json() == {"status": "ok", "redis": False}
+    assert resp.status_code == 503
+    assert resp.json() == {"status": "degraded", "redis": False}
 
 
 def test_healthz_redis_up() -> None:

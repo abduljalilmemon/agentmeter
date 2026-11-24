@@ -79,16 +79,40 @@ class LoopConfig(_Model):
     step_cap: int = Field(default=50, ge=1)
 
 
+BPS_PER_UNIT = 10_000
+
+
+def ratio_to_bps(value: Any) -> int:
+    """Convert a budget ratio (YAML: 0.75) to integer basis points (7500), exactly."""
+    if isinstance(value, bool):
+        raise ValueError("threshold must be a number, not a bool")
+    try:
+        ratio = Decimal(str(value).strip())
+    except InvalidOperation as exc:
+        raise ValueError(f"not a valid ratio: {value!r}") from exc
+    if not ratio.is_finite() or not 0 < ratio < 1:
+        raise ValueError(f"alert threshold must be between 0 and 1 (exclusive): {value!r}")
+    bps = ratio * BPS_PER_UNIT
+    if bps != bps.to_integral_value():
+        raise ValueError(f"alert threshold finer than 1 basis point: {value!r}")
+    return int(bps)
+
+
+Bps = Annotated[int, BeforeValidator(ratio_to_bps)]
+"""Integer basis points of a budget. Input is a ratio (``0.75``), stored as ``7500``."""
+
+
 class AlertsConfig(_Model):
-    # Ratios of a budget, not money amounts.
-    thresholds: list[float] = Field(default_factory=lambda: [0.5, 0.75, 0.9])
+    # YAML key "thresholds" holds ratios; stored as integer basis points so the M4
+    # threshold math (spent * 10_000 >= limit * bps) never touches a float.
+    thresholds_bps: list[Bps] = Field(
+        default_factory=lambda: [5_000, 7_500, 9_000], alias="thresholds"
+    )
     webhook_url: str | None = None
 
-    @field_validator("thresholds")
+    @field_validator("thresholds_bps")
     @classmethod
-    def _check_thresholds(cls, v: list[float]) -> list[float]:
-        if any(not 0 < t < 1 for t in v):
-            raise ValueError("alert thresholds must be between 0 and 1 (exclusive)")
+    def _check_thresholds(cls, v: list[int]) -> list[int]:
         if v != sorted(set(v)):
             raise ValueError("alert thresholds must be strictly increasing")
         return v

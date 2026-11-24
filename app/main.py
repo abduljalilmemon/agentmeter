@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from app import proxy
 from app.config import Settings, load_settings
@@ -109,8 +109,11 @@ def create_app(
     app = FastAPI(title="AgentMeter", lifespan=lifespan)
 
     @app.get("/healthz")
-    async def healthz(request: Request) -> dict[str, object]:
-        return {"status": "ok", "redis": await _redis_ok(request.app.state.redis)}
+    async def healthz(request: Request) -> JSONResponse:
+        # Budgets can't be enforced without Redis, so the proxy is not healthy without it.
+        if await _redis_ok(request.app.state.redis):
+            return JSONResponse({"status": "ok", "redis": True})
+        return JSONResponse({"status": "degraded", "redis": False}, status_code=503)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:

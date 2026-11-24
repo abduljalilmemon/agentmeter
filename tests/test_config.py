@@ -25,7 +25,7 @@ def test_example_yaml_loads() -> None:
 
     assert s.loop.repeat_threshold == 3
     assert s.loop.step_cap == 50
-    assert s.alerts.thresholds == [0.5, 0.75, 0.9]
+    assert s.alerts.thresholds_bps == [5_000, 7_500, 9_000]
     assert s.alerts.webhook_url is None  # ${ALERT_WEBHOOK} unset
 
 
@@ -94,8 +94,13 @@ def test_unknown_nested_key_rejected() -> None:
         Settings(loop={"repeat_threshold": 3, "step_kap": 50})
 
 
-def test_thresholds_validated() -> None:
+@pytest.mark.parametrize("bad", [[0.9, 0.5], [0.5, 0.5], [1.5], [0], [1], [0.00001], [True]])
+def test_thresholds_validated(bad: list) -> None:
     with pytest.raises(ValidationError):
-        Settings(alerts={"thresholds": [0.9, 0.5]})
-    with pytest.raises(ValidationError):
-        Settings(alerts={"thresholds": [1.5]})
+        Settings(alerts={"thresholds": bad})
+
+
+def test_thresholds_are_integer_bps() -> None:
+    s = Settings(alerts={"thresholds": [0.1, "0.25", 0.9999]})
+    assert s.alerts.thresholds_bps == [1_000, 2_500, 9_999]
+    assert all(type(t) is int for t in s.alerts.thresholds_bps)
