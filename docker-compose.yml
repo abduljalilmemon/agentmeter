@@ -18,6 +18,7 @@ services:
     environment:
       MOCK_PROMPT_TOKENS: ${MOCK_PROMPT_TOKENS:-10}
       MOCK_COMPLETION_TOKENS: ${MOCK_COMPLETION_TOKENS:-20}
+      MOCK_STREAM_CUT: ${MOCK_STREAM_CUT:-0}
 
   proxy:
     build:

@@ -132,10 +132,14 @@ def test_connection_refused_returns_502() -> None:
     assert resp.json()["error"]["type"] == "upstream_error"
 
 
-def test_stream_returns_501(client: TestClient) -> None:
-    resp = client.post("/v1/chat/completions", json={**REQUEST, "stream": True})
-    assert resp.status_code == 501
-    assert resp.json()["error"]["code"] == "stream_not_supported"
+def test_connect_timeout_returns_502() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("no route", request=request)
+
+    with _proxy_with(handler) as c:
+        resp = c.post("/v1/chat/completions", json=REQUEST)
+    assert resp.status_code == 502
+    assert resp.json()["error"]["code"] == "upstream_connect_timeout"
 
 
 def test_invalid_json_returns_400(client: TestClient) -> None:
