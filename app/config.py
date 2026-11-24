@@ -110,6 +110,7 @@ class Settings(BaseSettings):
 
     upstream: str = "https://api.openai.com/v1"
     redis_url: str = "redis://localhost:6379/0"
+    upstream_timeout_seconds: float = Field(default=600.0, gt=0)
     default_max_tokens: int = Field(default=1024, ge=1)
     pricing: dict[str, ModelPrice] = Field(default_factory=dict)
     budgets: Budgets = Field(default_factory=Budgets)

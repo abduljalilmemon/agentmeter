@@ -4,6 +4,10 @@ Env vars (read per request, so tests can change them):
   MOCK_PROMPT_TOKENS      default 10
   MOCK_COMPLETION_TOKENS  default 20
   MOCK_CONTENT            default "Hello from mock_upstream."
+  MOCK_FORCE_STATUS       if set (e.g. 400), return an OpenAI-style error with that status
+
+GET /_mock/last_request returns the headers and JSON body of the last chat request,
+so tests can check what the proxy forwarded.
 """
 
 from __future__ import annotations
@@ -14,8 +18,10 @@ import uuid
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 app = FastAPI(title="mock_upstream")
+_last_request: dict[str, Any] = {}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -30,9 +36,31 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request) -> dict[str, Any]:
+@app.get("/_mock/last_request")
+async def last_request() -> dict[str, Any]:
+    return _last_request
+
+
+@app.post("/v1/chat/completions", response_model=None)
+async def chat_completions(request: Request) -> dict[str, Any] | JSONResponse:
     body = await request.json()
+    _last_request.clear()
+    _last_request.update({"headers": dict(request.headers), "body": body})
+
+    forced = os.environ.get("MOCK_FORCE_STATUS")
+    if forced:
+        return JSONResponse(
+            status_code=int(forced),
+            content={
+                "error": {
+                    "message": f"mock forced status {forced}",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "mock_forced",
+                }
+            },
+        )
+
     prompt_tokens = _env_int("MOCK_PROMPT_TOKENS", 10)
     completion_tokens = _env_int("MOCK_COMPLETION_TOKENS", 20)
     return {
