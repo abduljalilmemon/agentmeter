@@ -385,3 +385,14 @@ def test_reset_of_a_closed_run(client: TestClient) -> None:
 
 def test_reset_rejects_an_invalid_run_id(client: TestClient) -> None:
     assert reset(client, run="bad*id").status_code == 400
+
+
+def test_alternating_loop_trips(redis_db: redis.Redis, upstream: Counting) -> None:
+    """A, B, A, B, A: no two consecutive requests are equal, but A's third sighting in the
+    run opens the breaker (the count is per fingerprint per run, not vs the last call)."""
+    with proxy_client(upstream, loop={"repeat_threshold": 3}) as c:
+        statuses = [chat(c, two(step), run="alt").status_code for step in "ABABA"]
+        assert statuses == [200, 200, 200, 200, 429]
+        assert_breaker_429(chat(c, two("C"), run="alt"), "loop", run="alt")
+    assert redis_db.hget(breaker_key("alt"), "source") == "request_repeats"
+    assert upstream.count == 4

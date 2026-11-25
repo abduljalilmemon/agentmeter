@@ -69,6 +69,7 @@ Upstream LLM API              Worker: threshold alerts → webhook
 - The breaker has two states for each run, CLOSED and OPEN. While it's OPEN, the proxy returns HTTP 429 with a structured body:
   `{"error": {"type": "agentmeter_breaker_open", "reason": "loop|budget|step_cap", "run_id": "...", "spent_usd": 0.41}}`
 - An admin endpoint can reset it manually: `POST /admin/runs/{id}/reset`.
+- An exhausted budget is not a breaker state: it returns 429 with `reason=budget` on each call that doesn't fit, and it does not open the breaker. A cheaper call can still fit, and a reset never has to touch money. Only `loop` and `step_cap` open the breaker.
 ### 3.4 Alerts
 - At 50%, 75% and 90% of any budget level, the proxy publishes an event. A `SET NX` flag on each threshold makes sure each alert fires once.
 - A worker consumes the Redis Stream and posts to a Slack-compatible webhook.
