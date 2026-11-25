@@ -47,6 +47,10 @@ M4 is done. Next is M5: Prometheus metrics and the `GET /runs/{id}` report (buil
     - A worker that acks before posting failed 3 worker tests.
   - Compose smoke, with a webhook catcher on the host (`ALERT_WEBHOOK=http://host.docker.internal:9009/hook`): a 70 µUSD run, 5 calls of 14 µUSD, then a 429. The stream had 3 `threshold_crossed` (5000, 7500, 9000) among 5 `call_settled`, the catcher received exactly 3 posts (50%, 75%, 90%), and 0 were left pending.
   - Retry in compose: with the catcher stopped, a second run's 3 alerts stayed pending and the worker logged 3 "will retry" warnings. After the catcher restarted, all 3 were delivered on retry, each once, and 0 were left pending.
+- M4 follow-ups (2026-11-26):
+  - Poison alerts: a claimed entry whose XPENDING `times_delivered` exceeds `alerts.max_attempts` (default 10) is logged at ERROR, copied to `am:alerts:dead` (original fields + `event_id` + `attempts`) and XACKed in one MULTI. Tested with `max_attempts=3`: 3 posts, then dead-lettered with no 4th post. Disabling the check made the test fail.
+  - The webhook text ends with `(event <stream id>)`.
+  - The CI step is renamed to "Concurrency (2 replicas)".
 - **M4 ✅** 50/75/90 fire exactly once per level under concurrent load on 2 replicas, in CI. The worker delivers at least once with retry and acks only after success.
 
 ## Decisions
@@ -182,8 +186,8 @@ M4 is done. Next is M5: Prometheus metrics and the `GET /runs/{id}` report (buil
 - **Heartbeat lost for longer than the TTL:** resolved in the M2 follow-ups: such a stream is now ended with `agentmeter_reservation_lost`. The overspend is bounded to what was generated before the next chunk.
 - **Loop detection coverage:** only the last two messages and the first response tool call are compared. Alternating loops (A, B, A, B) and loops whose arguments carry a counter or timestamp slip through, with the step cap as the backstop. Should M3+ add a short history (last N fingerprints) or argument masking?
 - **Breaker auto-close:** an OPEN breaker stays open until reset or run expiry. Is a half-open state (allow one probe after a cool-down) wanted for `step_cap`, or never?
-- **Poison alerts:** an alert whose post keeps failing is retried forever (every `retry_idle_seconds`), with no attempt limit or dead-letter stream. Should we cap deliveries (XPENDING has the delivery count) and park failures somewhere?
-- **Duplicate posts:** delivery is at least once. A worker killed between the webhook's 2xx and the XACK posts that alert again. Slack has no idempotency key; is that acceptable, or should the text carry the stream id so duplicates are recognizable?
+- **Poison alerts:** resolved in the M4 follow-ups (`alerts.max_attempts`, `am:alerts:dead`). Nothing replays the dead-letter stream yet.
+- **Duplicate posts:** delivery is at least once. A worker killed between the webhook's 2xx and the XACK posts that alert again. Slack has no idempotency key; the text now carries the stream id so duplicates are recognizable.
 - **Alerts on reserved money:** thresholds use `spent` only (per spec). A run with large in-flight reservations can be close to its limit without any alert until they settle. Should there be an optional `spent + reserved` early warning?
 - **Admin auth:** a single static bearer token. Is that enough for v1, or do we need per-operator tokens and an audit trail (the reset is only logged at WARNING)?
 - **Period boundaries:** day and month key names still come from each replica's clock (NTP assumed). Moving them to Redis `TIME` would mean computing the key names inside the script, which breaks the declared-`KEYS` contract further. Worth it?

@@ -152,6 +152,9 @@ class AlertsConfig(_Model):
     # A failed webhook post stays pending and is retried once idle this long (XAUTOCLAIM).
     retry_idle_seconds: float = Field(default=30.0, gt=0)
     webhook_timeout_seconds: float = Field(default=10.0, gt=0)
+    # Deliveries (XPENDING times_delivered) after which an alert is dead-lettered to
+    # am:alerts:dead and acked instead of being retried again.
+    max_attempts: int = Field(default=10, ge=1)
 
     @field_validator("thresholds_bps")
     @classmethod

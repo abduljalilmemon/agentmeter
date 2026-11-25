@@ -245,3 +245,51 @@ def test_end_to_end_proxy_to_webhook(redis_db: redis.Redis) -> None:
     hook = asyncio.run(deliver())
     assert len(hook.delivered) == 3
     assert [t.split("crossed ")[1].split(":")[0] for t in hook.delivered] == ["50%", "75%", "90%"]
+
+
+async def test_webhook_text_carries_the_stream_id(redis_db: redis.Redis, make_worker) -> None:
+    entry = redis_db.xadd(STREAM_KEY, THRESHOLD)
+    hook = Hook()
+    worker = make_worker(hook)
+    await worker.ensure_group()
+    await worker.run_once()
+    assert hook.delivered[0].endswith(f"(event {entry})")
+
+
+async def test_poison_alert_is_dead_lettered_after_max_attempts(
+    redis_db: redis.Redis, make_worker, caplog: pytest.LogCaptureFixture
+) -> None:
+    entry = redis_db.xadd(STREAM_KEY, THRESHOLD)
+    good = redis_db.xadd(STREAM_KEY, BREAKER)
+    hook = Hook()  # scripted per round below: THRESHOLD always fails, BREAKER succeeds
+    worker = make_worker(hook)
+    worker._settings = make_settings(
+        alerts={"webhook_url": HOOK, "retry_idle_seconds": IDLE, "max_attempts": 3}
+    )
+    await worker.ensure_group()
+    # Delivery 1 is the first read; deliveries 2 and 3 are XAUTOCLAIM retries.
+    hook.statuses = [500, 200]  # attempt 1 of THRESHOLD fails, BREAKER is delivered
+    await worker.run_once()
+    for _ in range(2):
+        hook.statuses = [500]
+        await asyncio.sleep(IDLE + 0.05)
+        await worker.run_once()
+    assert len([t for t in hook.attempts if "crossed 50%" in t]) == 3
+    assert redis_db.xlen("am:alerts:dead") == 0
+
+    # Delivery 4 exceeds max_attempts=3: dead-lettered without another post.
+    await asyncio.sleep(IDLE + 0.05)
+    with caplog.at_level("ERROR", logger="agentmeter.worker"):
+        await worker.run_once()
+    assert len([t for t in hook.attempts if "crossed 50%" in t]) == 3
+    assert pending(redis_db) == 0
+    assert worker.dead == 1
+    ((_dead_id, dead),) = redis_db.xrange("am:alerts:dead")
+    assert dead == {**THRESHOLD, "event_id": entry, "attempts": "3"}
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and entry in errors[0].getMessage()
+    assert len(hook.delivered) == 1 and hook.delivered[0].endswith(f"(event {good})")
+
+    await asyncio.sleep(IDLE + 0.05)
+    await worker.run_once()  # gone for good: no more attempts
+    assert len(hook.attempts) == 4

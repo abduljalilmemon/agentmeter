@@ -10,6 +10,9 @@ before the worker first ran are still delivered):
   ``alerts.retry_idle_seconds`` (XAUTOCLAIM). Delivery is at least once.
 - Every other event type is acked without posting.
 - With no ``webhook_url``, alerts are logged at WARNING and acked.
+- An alert delivered more than ``alerts.max_attempts`` times (XPENDING) is logged at
+  ERROR, copied to the ``am:alerts:dead`` stream and acked: a poison alert stops
+  being retried.
 
 Any number of workers can share the group: each entry goes to one of them.
 """
@@ -26,7 +29,14 @@ import httpx
 import redis.asyncio as redis
 
 from app.config import Settings, load_settings
-from app.events import ALERT_TYPES, ALERTS_GROUP, STREAM_KEY, alert_text, decode
+from app.events import (
+    ALERT_TYPES,
+    ALERTS_GROUP,
+    DEAD_LETTER_KEY,
+    STREAM_KEY,
+    alert_text,
+    decode,
+)
 
 log = logging.getLogger("agentmeter.worker")
 
@@ -48,6 +58,7 @@ class AlertWorker:
         self.consumer = consumer
         self._claim_cursor = "0-0"
         self.posted = 0  # webhook posts that got a 2xx (for logs and tests)
+        self.dead = 0  # alerts dead-lettered after max_attempts
 
     async def ensure_group(self) -> None:
         try:
@@ -65,10 +76,14 @@ class AlertWorker:
             STREAM_KEY, ALERTS_GROUP, self.consumer, min_idle, self._claim_cursor, count=BATCH
         )
         self._claim_cursor = _s(cursor)
-        for entry_id, fields in claimed:
-            if fields is not None:  # None: trimmed by MAXLEN while pending
-                await self._handle(_s(entry_id), decode(fields), retry=True)
-                handled += 1
+        live = [(_s(i), f) for i, f in claimed if f is not None]  # None: trimmed by MAXLEN
+        deliveries = await self._delivery_counts([i for i, _ in live])
+        for entry_id, fields in live:
+            if deliveries.get(entry_id, 0) > self._settings.alerts.max_attempts:
+                await self._dead_letter(entry_id, decode(fields), deliveries[entry_id])
+            else:
+                await self._handle(entry_id, decode(fields), retry=True)
+            handled += 1
 
         response = await self._redis.xreadgroup(
             ALERTS_GROUP, self.consumer, {STREAM_KEY: ">"}, count=BATCH, block=block_ms
@@ -89,6 +104,40 @@ class AlertWorker:
                 log.warning("worker loop error: %r", exc)
                 await asyncio.sleep(1)
 
+    async def _delivery_counts(self, entry_ids: list[str]) -> dict[str, int]:
+        """times_delivered for claimed entries (XAUTOCLAIM has just incremented it)."""
+        if not entry_ids:
+            return {}
+        rows = await self._redis.xpending_range(
+            STREAM_KEY,
+            ALERTS_GROUP,
+            min=entry_ids[0],
+            max=entry_ids[-1],
+            count=len(entry_ids),
+            consumername=self.consumer,
+        )
+        return {_s(row["message_id"]): int(row["times_delivered"]) for row in rows}
+
+    async def _dead_letter(self, entry_id: str, fields: dict[str, str], deliveries: int) -> None:
+        attempts = deliveries - 1  # this delivery is not attempted
+        log.error(
+            "alert %s dead-lettered after %d failed attempts: %s",
+            entry_id,
+            attempts,
+            alert_text(fields, entry_id),
+        )
+        # Copy and ack in one MULTI, so a crash can't leave it acked but not dead-lettered.
+        async with self._redis.pipeline(transaction=True) as pipe:
+            pipe.xadd(
+                DEAD_LETTER_KEY,
+                {**fields, "event_id": entry_id, "attempts": attempts},
+                maxlen=self._settings.events.stream_maxlen,
+                approximate=True,
+            )
+            pipe.xack(STREAM_KEY, ALERTS_GROUP, entry_id)
+            await pipe.execute()
+        self.dead += 1
+
     def _webhook_state(self) -> str:
         return "set" if self._settings.alerts.webhook_url else "not set: alerts are logged"
 
@@ -99,7 +148,7 @@ class AlertWorker:
         if fields.get("type") not in ALERT_TYPES:
             await self._ack(entry_id)
             return
-        text = alert_text(fields)
+        text = alert_text(fields, entry_id)
         url = self._settings.alerts.webhook_url
         if not url:
             log.warning("ALERT (no webhook_url) %s: %s", entry_id, text)

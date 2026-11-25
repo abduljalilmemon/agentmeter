@@ -29,6 +29,7 @@ from typing import Any
 
 STREAM_KEY = "am:events"
 ALERTS_GROUP = "am:alerts"
+DEAD_LETTER_KEY = "am:alerts:dead"
 
 CALL_SETTLED = "call_settled"
 THRESHOLD_CROSSED = "threshold_crossed"
@@ -86,8 +87,17 @@ def _who(fields: Mapping[str, str]) -> str:
     return ", ".join(parts)
 
 
-def alert_text(fields: Mapping[str, str]) -> str:
-    """Slack-compatible message text for an alert event."""
+def alert_text(fields: Mapping[str, str], entry_id: str | None = None) -> str:
+    """Slack-compatible message text for an alert event.
+
+    With ``entry_id`` (the am:events stream id) the text ends with ``(event <id>)``, so a
+    duplicate delivery (at least once) can be recognized as the same alert.
+    """
+    text = _alert_text(fields)
+    return f"{text} (event {entry_id})" if entry_id else text
+
+
+def _alert_text(fields: Mapping[str, str]) -> str:
     kind = fields.get("type")
     if kind == THRESHOLD_CROSSED:
         spent, limit = _int(fields, "spent"), _int(fields, "limit")

@@ -36,5 +36,5 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -q -m "not concurrency"
-      - name: Concurrency (100 calls, 2 replicas, budget fits 10)
+      - name: Concurrency (2 replicas)
         run: pytest -v -m concurrency

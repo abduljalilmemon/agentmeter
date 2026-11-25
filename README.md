@@ -158,12 +158,14 @@ All values are strings: money in integer micro-USD, thresholds in integer basis 
 - `threshold_crossed` and `breaker_open` are posted as Slack-compatible JSON, `{"text": "..."}`, to `alerts.webhook_url`. Other events are acknowledged without a post.
 - An entry is acknowledged (`XACK`) only after the webhook answers 2xx. A failed post stays pending and is retried once it has been idle for `alerts.retry_idle_seconds`, by this worker or any other (`XAUTOCLAIM`). Delivery is at least once.
 - Without a `webhook_url`, alerts are logged at WARNING and acknowledged.
+- An alert delivered more than `alerts.max_attempts` times (default 10) is logged at ERROR, copied to the `am:alerts:dead` stream (with `event_id` and `attempts`) and acknowledged, so a poison alert stops being retried.
+- Each post ends with `(event <stream id>)`, so a repeated delivery can be recognized as the same alert.
 - The group is created on first start from the beginning of the stream, so alerts written before the worker ever ran are still delivered.
 
 Example post:
 
 ```
-:warning: AgentMeter: run budget `run:ticket-4711` crossed 75%: spent $0.000056 of $0.00007 (last call: run `ticket-4711`)
+:warning: AgentMeter: run budget `run:ticket-4711` crossed 75%: spent $0.000056 of $0.00007 (last call: run `ticket-4711`) (event 1795649434478-0)
 ```
 
 ## Admin
@@ -233,6 +235,7 @@ events:
 | `alerts.webhook_url` | unset | Slack-compatible incoming webhook for the worker. Unset or empty: alerts are only logged. |
 | `alerts.retry_idle_seconds` | `30` | A failed webhook post is retried once it has been pending this long. |
 | `alerts.webhook_timeout_seconds` | `10` | httpx timeout for one webhook post. |
+| `alerts.max_attempts` | `10` | Deliveries after which a failing alert is dead-lettered to `am:alerts:dead` and acknowledged. |
 | `events.stream_maxlen` | `100000` | Approximate length cap of `am:events` (`XADD MAXLEN ~`). |
 
 `${VAR}` and `${VAR:-default}` placeholders in the YAML are filled from the environment. Every key can also be overridden with an `AGENTMETER_` variable, using `__` for nesting. For example: `AGENTMETER_UPSTREAM`, `AGENTMETER_REDIS_URL`, `AGENTMETER_BUDGETS__DEFAULT_RUN_USD=1.25`.
@@ -310,7 +313,7 @@ Progress notes and design decisions are in [PROGRESS.md](PROGRESS.md). The full 
 - **`max_tokens` injection and o-series models:** the injected `max_tokens` is rejected by models that only accept `max_completion_tokens`. Set `max_completion_tokens` yourself for those.
 - **Loop detection is heuristic:** only the last two messages and the first tool call of a response are compared. A loop that alternates between three or more states, or varies an argument each time (a counter, a timestamp), is not detected; the step cap is the backstop for those. Polling agents that legitimately repeat should send `X-AM-Loop-Exempt: true` or get a per-agent override.
 - **Breaker state is per run only:** there is no agent-wide or team-wide breaker, and an OPEN breaker never closes on its own (no half-open state) before its keys expire with the run.
-- **Alerts are at least once:** if the worker dies after the webhook accepted a post but before the `XACK`, that alert is posted again. An alert that keeps failing is retried every `retry_idle_seconds` with no limit and no dead-letter queue; an entry trimmed from the stream by `MAXLEN` while still pending is dropped.
+- **Alerts are at least once:** if the worker dies after the webhook accepted a post but before the `XACK`, that alert is posted again. An alert that keeps failing is retried every `retry_idle_seconds` up to `max_attempts` deliveries, then dead-lettered; an entry trimmed from the stream by `MAXLEN` while still pending is dropped.
 - **No alerts for reserved money:** thresholds are measured on `spent` only, so a burst of large in-flight reservations alerts only once those calls settle.
 - **Only `/v1/chat/completions`** is proxied. Other endpoints, including the Responses API and Anthropic's `/v1/messages`, are not.
 
