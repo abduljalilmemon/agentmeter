@@ -6,6 +6,7 @@ WORKDIR /srv
 
 COPY pyproject.toml README.md ./
 COPY app ./app
+COPY worker ./worker
 RUN pip install --no-cache-dir .
 
 # Fetch the tokenizer files at build time so containers never download them at runtime.

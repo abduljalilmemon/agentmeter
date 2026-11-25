@@ -37,3 +37,16 @@ services:
         condition: service_healthy
       mock_upstream:
         condition: service_started
+
+  worker:
+    # Same image as the proxy; posts threshold_crossed / breaker_open alerts to the webhook.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "worker.alerts"]
+    environment:
+      AGENTMETER_REDIS_URL: redis://redis:6379/0
+      ALERT_WEBHOOK: ${ALERT_WEBHOOK:-}
+    depends_on:
+      redis:
+        condition: service_healthy
