@@ -1,6 +1,7 @@
 """BudgetClient + Lua scripts against a real Redis (test database, flushed per test)."""
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
@@ -10,9 +11,11 @@ import redis.asyncio as aredis
 
 from app.budget import (
     PERIOD_GRACE_SECONDS,
+    RESERVATIONS_KEY,
     BudgetClient,
     Rejection,
     Reservation,
+    SettleResult,
     agent_key,
     run_key,
     team_key,
@@ -53,7 +56,11 @@ async def test_reserve_writes_every_level(budget: BudgetClient, redis_db: redis.
     stored = redis_db.hgetall(resv.key)
     assert stored["amount"] == "100"
     assert stored["keys"].split("\n") == [lv.key for lv in resv.levels]
-    assert 0 < redis_db.ttl(resv.key) <= 3_600
+    # Expiry lives in the index (Redis clock, ms), not as a TTL on the hash.
+    assert redis_db.ttl(resv.key) == -1
+    score = redis_db.zscore(RESERVATIONS_KEY, resv.id)
+    now_ms = int(time.time() * 1000)
+    assert now_ms + 3_590_000 < score <= now_ms + 3_601_000
 
 
 def test_key_names() -> None:
@@ -129,11 +136,13 @@ async def test_settle_moves_reserved_into_spent(
 ) -> None:
     resv = await budget.reserve(ident(agent="bot", team="core"), 250, now=NOW)
     assert isinstance(resv, Reservation)
-    assert await budget.settle(resv, 37) is True
+    assert await budget.settle(resv, 37) is SettleResult.RELEASED
     for lv in resv.levels:
         state = fields(redis_db, lv.key)
         assert (state["spent"], state["reserved"]) == (37, 0)
-    assert not redis_db.exists(resv.key)
+    assert redis_db.hgetall(resv.key) == {"settled": "1"}  # tombstone
+    assert 0 < redis_db.pttl(resv.key) <= 3_600_000
+    assert redis_db.zcard(RESERVATIONS_KEY) == 0
     state = await budget.state(run_key("r1"))
     assert (state.limit, state.spent, state.reserved) == (1_000, 37, 0)
 
@@ -143,9 +152,18 @@ async def test_settle_after_reservation_expired(
 ) -> None:
     resv = await budget.reserve(ident(), 250, now=NOW)
     assert isinstance(resv, Reservation)
-    redis_db.delete(resv.key)  # what expiry (or the M2c sweeper) does
-    assert await budget.settle(resv, 37) is False
+    redis_db.delete(resv.key)  # hash gone without a release (e.g. deleted by hand)
+    assert await budget.settle(resv, 37) is SettleResult.GONE
     assert fields(redis_db, run_key("r1")) == {"limit": 1_000, "spent": 37, "reserved": 250}
+    assert redis_db.zcard(RESERVATIONS_KEY) == 0
+
+
+async def test_second_settle_changes_nothing(budget: BudgetClient, redis_db: redis.Redis) -> None:
+    resv = await budget.reserve(ident(), 250, now=NOW)
+    assert isinstance(resv, Reservation)
+    assert await budget.settle(resv, 37) is SettleResult.RELEASED
+    assert await budget.settle(resv, 37) is SettleResult.DUPLICATE
+    assert fields(redis_db, run_key("r1")) == {"limit": 1_000, "spent": 37, "reserved": 0}
 
 
 async def test_settle_reapplies_ttl_on_recreated_key(

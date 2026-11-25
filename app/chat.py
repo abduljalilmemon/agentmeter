@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -16,7 +17,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
 from app import proxy
-from app.budget import BudgetClient, Rejection, Reservation
+from app.budget import BudgetClient, Rejection, Reservation, SettleResult
 from app.config import MICRO_PER_USD, Settings
 from app.estimate import Estimate, EstimateError, count_text_tokens, estimate
 from app.identity import Identity
@@ -56,9 +57,12 @@ class CallContext:
         actual = self.actual_micro(result.usage)
         if actual is not None:
             return actual, "usage"
-        # No usage (cut, client gone, or upstream omitted it): bill the estimated prompt
-        # plus a tiktoken count of what was generated and relayed.
-        # TODO: tokens generated upstream after a client disconnect are not seen here.
+        if result.client_disconnected:
+            # The upstream may have kept generating after we stopped reading, and we can't
+            # see those tokens: bill the worst case.
+            return self.estimate_micro, "estimate:client_disconnected"
+        # Upstream cut or ended without usage: bill the estimated prompt plus a tiktoken
+        # count of what was generated and relayed.
         return self.cost(self.estimate.input_tokens, result.streamed_output_tokens), "tiktoken"
 
 
@@ -127,24 +131,41 @@ class _Settlement:
             return
         self.done = True
         with anyio.CancelScope(shield=True):
-            found = None
+            outcome: SettleResult | None = None
             try:
-                found = await self._budget.settle(self._reservation, actual)
+                outcome = await self._budget.settle(self._reservation, actual)
             except (redis.RedisError, OSError):
-                # The reservation expires on its own; its amount stays reserved (safe side).
+                # The sweeper releases the reservation once it expires (safe side).
                 log.exception("settle failed run_id=%s", self._ctx.identity.run_id)
         details = " ".join(f"{k}={v}" for k, v in extra.items())
         log.info(
-            "settled run_id=%s model=%s estimate_micro=%d actual_micro=%d how=%s "
-            "reservation_found=%s %s",
+            "settled run_id=%s model=%s estimate_micro=%d actual_micro=%d how=%s reservation=%s %s",
             self._ctx.identity.run_id,
             self._ctx.model,
             self._ctx.estimate_micro,
             actual,
             how,
-            found,
+            outcome.value if outcome else "error",
             details,
         )
+
+
+async def _heartbeat(
+    budget: BudgetClient, reservation: Reservation, interval: float, run_id: str
+) -> None:
+    """Keep a streaming call's reservation from being swept while the stream is open."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            alive = await budget.extend(reservation)
+        except (redis.RedisError, OSError) as exc:
+            log.warning("reservation heartbeat failed run_id=%s: %r", run_id, exc)
+            continue
+        if not alive:
+            # Swept (e.g. Redis was unreachable for longer than the TTL). Settle will add
+            # the cost only; the reserved amount was already released.
+            log.warning("reservation gone mid-stream run_id=%s", run_id)
+            return
 
 
 def _usage_from(response: Response) -> dict[str, Any] | None:
@@ -260,6 +281,9 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
             request.query_params,
             on_finish,
             partial(count_text_tokens, model),
+            keepalive=partial(
+                _heartbeat, budget, reserved, cfg.reservation_heartbeat_seconds, identity.run_id
+            ),
         )
         if forwarded.outcome is not proxy.Outcome.STREAMING:
             await _settle_forwarded(settle, ctx, forwarded)

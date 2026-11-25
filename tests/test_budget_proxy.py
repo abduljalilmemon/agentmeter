@@ -9,7 +9,7 @@ import redis
 from fastapi.testclient import TestClient
 from openai import OpenAI, RateLimitError
 
-from app.budget import run_key
+from app.budget import RESERVATIONS_KEY, run_key
 from app.estimate import count_text_tokens
 from app.main import create_app
 from mock_upstream.main import app as mock_app
@@ -40,7 +40,10 @@ def test_spent_equals_sum_of_mock_usage(redis_db: redis.Redis) -> None:
     state = run_state(redis_db, "sum")
     assert state["spent"] == n * MOCK_CALL_MICRO
     assert state["reserved"] == 0
-    assert redis_db.keys("am:resv:*") == []
+    assert redis_db.zcard(RESERVATIONS_KEY) == 0
+    tombstones = redis_db.keys("am:r:*")
+    assert len(tombstones) == n  # one per call, and nothing but the settled marker in each
+    assert all(redis_db.hgetall(k) == {"settled": "1"} for k in tombstones)
 
 
 def test_exhausted_run_gets_429(redis_db: redis.Redis) -> None:

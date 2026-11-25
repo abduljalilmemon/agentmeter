@@ -1,24 +1,37 @@
--- settle.lua: turn a reservation into actual spend.
+-- settle.lua: turn a reservation into actual spend, exactly once.
 --
--- KEYS[1]          reservation key  am:resv:{id}
--- KEYS[2..n+1]     the same level hashes the reservation was made on
--- ARGV[1]          actual cost, integer micro-USD
--- ARGV[2..n+1]     level i absolute expiry, unix seconds (re-applied if a key lost its TTL)
+-- KEYS[1]          reservation index  am:resv (ZSET)
+-- KEYS[2]          reservation hash   am:r:{id}
+-- KEYS[3..n+2]     the same level hashes the reservation was made on
+-- ARGV[1]          reservation id
+-- ARGV[2]          actual cost, integer micro-USD
+-- ARGV[3]          tombstone TTL, milliseconds
+-- ARGV[4..n+3]     level i absolute expiry, unix seconds (re-applied if a key lost its TTL)
 --
--- Reservation present: reserved -= amount and spent += actual at each level, then the
--- reservation is deleted. Reservation gone (expired or swept): spent += actual only.
--- Returns 1 if the reservation was found, else 0.
+-- Returns
+--   1  reservation found: reserved -= amount and spent += actual at each level
+--   0  reservation gone (swept): spent += actual only; the sweep already released it
+--   2  already settled: nothing changes
 --
--- Not idempotent by itself: the caller settles each reservation id once.
+-- Afterwards the hash is replaced by a tombstone {settled=1} that lives for the TTL, so a
+-- repeated settle can neither release twice nor count the spend twice. The id leaves the
+-- index, so a later sweep never sees it.
 
-local resv_key = KEYS[1]
-local actual_s = ARGV[1]
-local n = #KEYS - 1
+local index_key = KEYS[1]
+local resv_key = KEYS[2]
+local resv_id = ARGV[1]
+local actual_s = ARGV[2]
+local tombstone_ms = ARGV[3]
+local n = #KEYS - 2
 
-local amount = redis.call('HGET', resv_key, 'amount')
+local stored = redis.call('HMGET', resv_key, 'amount', 'settled')
+local amount, settled = stored[1], stored[2]
+if settled then
+  return 2
+end
 
 for i = 1, n do
-  local key = KEYS[i + 1]
+  local key = KEYS[i + 2]
   if amount and amount ~= '0' then
     -- Negate as a string: Lua 5.1 would format a large number as 1e+14.
     local reserved = redis.call('HINCRBY', key, 'reserved', '-' .. amount)
@@ -29,12 +42,15 @@ for i = 1, n do
   end
   redis.call('HINCRBY', key, 'spent', actual_s)
   if redis.call('TTL', key) == -1 then
-    redis.call('EXPIREAT', key, ARGV[i + 1])
+    redis.call('EXPIREAT', key, ARGV[i + 3])
   end
 end
 
+redis.call('ZREM', index_key, resv_id)
+redis.call('DEL', resv_key)
+redis.call('HSET', resv_key, 'settled', '1')
+redis.call('PEXPIRE', resv_key, tombstone_ms)
 if amount then
-  redis.call('DEL', resv_key)
   return 1
 end
 return 0

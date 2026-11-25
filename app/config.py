@@ -151,14 +151,22 @@ class Settings(BaseSettings):
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     # A run's budget key lives this long after its last reserve.
     run_ttl_seconds: int = Field(default=7 * 86_400, gt=0)
-    # An unsettled reservation is dropped after this long (its amount stays reserved
-    # until the M2c sweeper). Must outlast the longest call, including long streams.
+    # An unsettled reservation is released by the sweeper this long after its last
+    # reserve or heartbeat. Must outlast a non-streaming call (streams send heartbeats).
     reservation_ttl_seconds: int = Field(default=3_600, gt=0)
+    # A live stream pushes its reservation's expiry forward this often.
+    reservation_heartbeat_seconds: float = Field(default=60.0, gt=0)
+    # How often each replica sweeps expired reservations.
+    sweep_interval_seconds: float = Field(default=30.0, gt=0)
 
     @model_validator(mode="after")
     def _reservation_outlives_calls(self) -> Settings:
         if self.reservation_ttl_seconds <= self.upstream_timeout_seconds:
             raise ValueError("reservation_ttl_seconds must exceed upstream_timeout_seconds")
+        if self.reservation_heartbeat_seconds >= self.reservation_ttl_seconds:
+            raise ValueError(
+                "reservation_heartbeat_seconds must be less than reservation_ttl_seconds"
+            )
         return self
 
     @classmethod

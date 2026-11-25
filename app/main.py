@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from app.chat import StreamHook, handle_chat, log_stream_result
 from app.config import Settings, load_settings
 from app.identity import RUN_ID_HEADER, IdentityError, parse_identity
 from app.pricing import PriceTable
+from app.sweeper import run_sweeper
 
 REDIS_TIMEOUT_S = 1.0
 log = logging.getLogger("agentmeter")
@@ -52,9 +54,13 @@ def create_app(
         )
         app.state.budget = BudgetClient(app.state.redis, cfg)
         app.state.http = proxy.create_client(cfg.upstream_timeout_seconds, upstream_transport)
+        sweeper = asyncio.create_task(run_sweeper(app.state.budget, cfg.sweep_interval_seconds))
         try:
             yield
         finally:
+            sweeper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweeper
             await app.state.http.aclose()
             await app.state.redis.aclose()
 

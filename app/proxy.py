@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import json
 import logging
@@ -155,6 +156,8 @@ class StreamResult:
 
 StreamFinish = Callable[[StreamResult], Awaitable[None]]
 TokenCounter = Callable[[str], int]
+# Runs alongside the relay for as long as the stream is open; cancelled when it ends.
+Keepalive = Callable[[], Awaitable[None]]
 
 
 def _delta_texts(event: dict[str, Any]) -> Iterator[str]:
@@ -289,11 +292,14 @@ class UpstreamStreamingResponse(StreamingResponse):
         result: StreamResult,
         on_finish: StreamFinish | None,
         count_tokens: TokenCounter | None = None,
+        keepalive: Keepalive | None = None,
     ) -> None:
         self._upstream = upstream
         self._result = result
         self._on_finish = on_finish
         self._count_tokens = count_tokens
+        self._keepalive = keepalive
+        self._keepalive_task: asyncio.Task[None] | None = None
         self._finished = False
         self._relay_ended = False  # upstream ran out (normally or with an error)
         self._iterator = self._relay()
@@ -338,18 +344,28 @@ class UpstreamStreamingResponse(StreamingResponse):
         # The client can go away as OSError/ClientDisconnect (ASGI spec >= 2.4) or as a
         # cancellation from Starlette's disconnect listener that is swallowed by its task
         # group; either way the relay never reached its end.
+        if self._keepalive is not None:
+            self._keepalive_task = asyncio.create_task(self._keepalive())
         try:
             await super().__call__(scope, receive, send)
         finally:
             await self.close()
 
     async def close(self) -> None:
-        """Idempotent cleanup: stop the relay, close upstream, report the result once."""
+        """Idempotent cleanup: stop the keepalive and the relay, close upstream, report once."""
         if self._finished:
             return
         self._finished = True
         self._result.client_disconnected = not self._relay_ended
         with anyio.CancelScope(shield=True):
+            if self._keepalive_task is not None:
+                self._keepalive_task.cancel()
+                try:
+                    await self._keepalive_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    log.exception("stream keepalive failed")
             try:
                 await self._iterator.aclose()
             finally:
@@ -369,10 +385,12 @@ async def forward_stream(
     params: Mapping[str, str] | None = None,
     on_finish: StreamFinish | None = None,
     count_tokens: TokenCounter | None = None,
+    keepalive: Keepalive | None = None,
 ) -> Forwarded:
     """Open a streaming upstream request (``body`` already has include_usage set).
 
-    ``on_finish`` runs only for Outcome.STREAMING; other outcomes are final on return.
+    ``on_finish`` and ``keepalive`` apply only to Outcome.STREAMING; other outcomes are
+    final on return.
     """
     fwd_headers = [(k, v) for k, v in upstream_request_headers(headers) if k != "content-type"]
     request = client.build_request(
@@ -401,6 +419,6 @@ async def forward_stream(
         return Forwarded(response, Outcome.UPSTREAM_ERROR)
 
     return Forwarded(
-        UpstreamStreamingResponse(upstream, StreamResult(), on_finish, count_tokens),
+        UpstreamStreamingResponse(upstream, StreamResult(), on_finish, count_tokens, keepalive),
         Outcome.STREAMING,
     )
