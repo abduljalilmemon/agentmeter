@@ -1,7 +1,7 @@
 # Progress
 
 ## Current milestone
-M2 is done. Next is M3: loop detection, step cap, breaker state and admin reset.
+M3 is done. Next is M4: Redis Stream events, one-shot 50/75/90% alerts and the webhook worker. The LangGraph demo agent is deferred to M6.
 
 ## Done
 - M0 (2026-11-24): pyproject, FastAPI app with `GET /healthz` (pings Redis), config loader, example `agentmeter.yaml`, fake OpenAI `mock_upstream`, Dockerfiles, docker-compose (redis, mock_upstream, proxy), CI (ruff + pytest with a Redis service). `docker compose up` gives `/healthz` → `{"status":"ok","redis":true}`.
@@ -22,6 +22,17 @@ M2 is done. Next is M3: loop detection, step cap, breaker state and admin reset.
   - `tests/test_concurrency.py`: 2 proxy apps under their own uvicorn servers, one Redis, the live mock. 100 parallel calls against a run budget that fits 10 give exactly 10 × 200 and 90 × 429, with `spent == limit` and `reserved == 0`. It runs as its own CI step. With a deliberately non-atomic reserve swapped in, all 100 calls went through and the test failed.
   - Compose check by hand, with 2 proxy containers (`proxy` on 8080, plus a `proxy2` service extending it on 8081), Redis and the mock set to usage = estimate: 4 runs of 100 calls split evenly across the two, each gave `{200: 10, 429: 90}` and ended at `limit=620 spent=620 reserved=0` with an empty `am:resv`. Both containers served successful calls in every run (8/2, 5/5, 4/6, 6/4). `docker compose --scale proxy=2` with a host port range didn't work on Docker Desktop for Windows (both replicas tried to bind 8080), hence the second service.
 - **M2 ✅** The concurrency test passes with 2 replicas, and the spent total matches the sum of mock usage exactly.
+- M2 follow-ups (2026-11-25):
+  - A stream whose heartbeat finds its reservation gone now ends with an `agentmeter_reservation_lost` SSE error event and settles normally (no usage, so estimated input + tiktoken).
+  - A failed settle logs at ERROR with the run id, reservation id and the unrecorded amount. It's listed in the README's known limitations.
+  - 100 parallel calls across 2 replicas with mock usage (14 µUSD) below the estimate (62): `spent` is exactly `successes × 14`, with roomy and tight budgets.
+- M3 (2026-11-25): loop detection, step cap and the per-run circuit breaker.
+  - `app/loops.py` fingerprints, `app/breaker.py` with `app/lua/gate.lua` (before reserve) and `app/lua/toolcall.lua` (after a successful response), and `POST /admin/runs/{id}/reset`.
+  - Scripted broken-tool OpenAI SDK agent against the mock: stopped on call 4 with `reason=loop` (threshold 3; call 1 has one message, so no fingerprint). Later calls get 429 and never reach the mock.
+  - 20 parallel identical calls over 2 replicas with threshold 3: exactly 2 reached the upstream in 5 of 5 runs. With a non-atomic gate (check, 10 ms await, write) swapped in, 14 to 19 got through and the test failed. The connections are opened before the burst; without that, connection setup spread the calls out enough that the racy gate passed too.
+  - Breaking `>=` → `>` (threshold), `>` → `>=` (step cap), or keeping `tool_call_id` in fingerprints made 6, 4 and 5 tests fail respectively.
+  - Compose smoke with the built image: identical calls gave `[200, 200, 429, 429]`, the 429 carried `x-should-retry: false` and `reason: loop`. Reset with a wrong token gave 401, with the right one 200, and the budget hash was unchanged (`spent=28`) and the run worked again. `X-AM-Loop-Exempt: true` let 3 identical calls through. Without a token configured, reset gave 404.
+- **M3 ✅** The scripted broken-tool agent is stopped after N repeats with `reason=loop`. (The LangGraph version of the demo is part of M6.)
 
 ## Decisions
 - **Money parsing:** YAML and env values are in USD and converted to integer micro-USD via `Decimal(str(v))`. A value that isn't a whole number of micro-USD is rejected, not rounded. Prices are stored as micro-USD per 1M tokens (`input_per_mtok`, `output_per_mtok`). Model fields drop the `_usd` suffix (`budgets.default_run`, `agents[x].daily`) and use the YAML key as an alias, so `_usd` never labels a micro-USD int.
@@ -101,10 +112,43 @@ M2 is done. Next is M3: loop detection, step cap, breaker state and admin reset.
 - **Concurrency test design:** the mock reports usage equal to the worst-case estimate, so a settle frees no headroom and "exactly 10 of 100" holds whatever the timing. With actual < estimate, an 11th call could rightly fit once others settle. The two replicas are separate uvicorn servers in threads, each with its own event loop, Redis pool and upstream client. CI runs it as a separate step (`pytest -m concurrency`). A local `pytest -q` runs it too.
 - **Single Redis node:** a request's keys span hash slots, so Redis Cluster isn't supported as is.
 
+- **Breaker gate (gate.lua), one script per request, run after request validation and the estimate and right before reserve:**
+  - An OPEN breaker refuses at once. Refused-while-open calls don't add steps.
+  - Otherwise the step count increments, and call `step_cap + 1` opens with `step_cap`.
+  - Then the request fingerprint count increments, and the `repeat_threshold`-th sighting opens with `loop`.
+  - The call that opens it is refused. A refused call reserves nothing and never reaches the upstream.
+  - A call that passes the gate but is then refused for budget, or fails upstream, still counts as a step and a sighting. The gate can't know the outcome yet, and counting failed attempts is what catches a retry loop.
+  - A Redis error at the gate fails closed with 503, like reserve.
+- **Breaker keys:** `am:brk:{run}` (present = OPEN: `reason`, `source`, `steps`, `opened_ms` from Redis `TIME`), `am:steps:{run}`, `am:fp:{run}` (hash fingerprint → count) and `am:tc:{run}` (response streak).
+  - All get `EXPIREAT now + run_ttl_seconds` on every write, which is the run budget key's expiry. Refused-while-open calls don't refresh it, so a stopped run's breaker lives at most `run_ttl_seconds` after it opened.
+- **Budget is not a breaker state:** an exhausted budget still answers 429 `reason=budget` per call (M2b) without opening `am:brk`. A cheaper call can still fit, and a reset never needs to touch money.
+- **Request fingerprint (`app/loops.py`):** sha256 of canonical JSON (`sort_keys`, compact separators, `ensure_ascii=False`) of the last two messages.
+  - Dropped: `id`, `tool_call_id`, `index`.
+  - Tool-call `arguments` are parsed and re-dumped (unparseable arguments stay as whitespace-collapsed text).
+  - A `tool` message's content is parsed as JSON when it is JSON. Text content has its whitespace collapsed (going beyond "whitespace" in arguments only), so a re-sent result with different formatting still matches.
+  - Fewer than 2 messages: no fingerprint (the step cap still applies).
+- **Response side (toolcall.lua):** the fingerprint is sha256 of the first tool call's name + canonical arguments (choice 0, tool call 0).
+  - It's recorded after a successful non-streaming response, or after a stream that finished cleanly (`[DONE]`, no error, client still there). A cut stream neither extends nor breaks the streak.
+  - A response without a tool call breaks the streak. K identical in a row opens the breaker with `source=response_tool_calls`, for the *next* call (this response is already delivered).
+  - Streaming assembles the first tool call from its deltas, capped at 256 KiB of arguments (beyond that: no fingerprint).
+  - A Redis error here is logged as a warning; the response is already delivered.
+- **Per-agent overrides:** `loop.agents.<name>` can override `repeat_threshold` and `step_cap`, and also `consecutive_tool_calls` (beyond the spec, for the same polling reason). Unknown keys are rejected.
+- **`X-AM-Loop-Exempt`:** `true`/`false`/`1`/`0` (case-insensitive), other values give 400 `invalid_header`. Exempt calls skip both the request fingerprint and the response tool-call streak. The step cap still applies.
+- **429 for an open breaker (PLAN §3.3):** `type: agentmeter_breaker_open`, `reason` (`loop`/`step_cap`), `run_id`, `spent_usd` (float for display, as in the budget 429), plus `steps`, `message`, `param` and `code` (`loop_detected`/`step_cap_reached`). It sets `x-should-retry: false`.
+- **Admin reset:**
+  - `admin_token` is a `SecretStr`; unset or blank disables the endpoint, which returns 404 (`{"detail":"Not Found"}`, like an unknown route).
+  - Only `Authorization: Bearer <token>` is accepted, compared with `hmac.compare_digest`. Anything else gives 401 with `WWW-Authenticate: Bearer`. An invalid run id gives 400.
+  - It deletes the four breaker keys in one MULTI and returns `breaker_was` (the old fields, or null) and `steps_was`. Budget keys are never touched. Compose passes `AGENTMETER_ADMIN_TOKEN` through.
+- **Mock upstream:** `MOCK_TOOL_CALL` (JSON `{name, arguments}`) answers with that tool call and a fresh call id each time. Streaming sends id + name, then the arguments in two pieces, like OpenAI.
+- **Lost reservation mid-stream:** the heartbeat's result is checked once per upstream chunk, so an idle upstream ends the stream no later than its `upstream_timeout_seconds`.
+
 ## Open questions
 - **o-series models:** they reject `max_tokens` and require `max_completion_tokens`. Should we inject `max_completion_tokens` for them, or for everyone (OpenAI's newer name, but less supported by OpenAI-compatible upstreams)?
 - **Image tokens:** the image estimate is a flat constant. gpt-4o-mini bills images at roughly 33× the token count, so 1105 can under-count there. We need a per-model image formula before relying on budgets with vision.
-- **Heartbeat lost for longer than the TTL:** if one replica can't reach Redis for over an hour while its stream keeps running, the sweeper (on another replica) releases that reservation mid-call. Other calls can then use that headroom, and the late settle only adds the cost. This is a bounded overspend, at most one estimate per affected stream. Should a stream whose heartbeat finds the reservation gone be cut instead?
+- **Heartbeat lost for longer than the TTL:** resolved in the M2 follow-ups: such a stream is now ended with `agentmeter_reservation_lost`. The overspend is bounded to what was generated before the next chunk.
+- **Loop detection coverage:** only the last two messages and the first response tool call are compared. Alternating loops (A, B, A, B) and loops whose arguments carry a counter or timestamp slip through, with the step cap as the backstop. Should M3+ add a short history (last N fingerprints) or argument masking?
+- **Breaker auto-close:** an OPEN breaker stays open until reset or run expiry. Is a half-open state (allow one probe after a cool-down) wanted for `step_cap`, or never?
+- **Admin auth:** a single static bearer token. Is that enough for v1, or do we need per-operator tokens and an audit trail (the reset is only logged at WARNING)?
 - **Period boundaries:** day and month key names still come from each replica's clock (NTP assumed). Moving them to Redis `TIME` would mean computing the key names inside the script, which breaks the declared-`KEYS` contract further. Worth it?
 - **Failed settle loses the cost:** when settle itself fails (Redis blip), the sweeper releases the reservation but the actual cost is never added to `spent`. Should the proxy retry settles from a local queue?
 - **Cached prompt tokens:** settlement prices all `prompt_tokens` at the full input price. Cached-token discounts are ignored, so the cost is over-counted, which is safe. Is that OK for v1?

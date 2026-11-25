@@ -48,8 +48,23 @@ In compose the proxy talks to `mock_upstream`, which returns canned answers and 
 | `X-AM-Agent` | The agent name. It enforces the agent's daily budget when one is configured. |
 | `X-AM-Team` | The team name. It enforces the team's monthly budget when one is configured. |
 | `X-AM-Run-Budget` | The run limit in USD, e.g. `0.25`. Defaults to `budgets.default_run_usd`. The first call of a run fixes the limit, and later values are ignored. |
+| `X-AM-Loop-Exempt` | `true` or `false` (default). `true` skips loop detection for this call, both the request fingerprint and the response tool-call streak, for legitimate polling. The step cap still applies. |
 
 Ids and names must match `[A-Za-z0-9._:-]{1,128}`. All `X-AM-*` headers are removed before forwarding. Every response carries `X-AM-Run-Id`, except the 400 for an invalid `X-AM-*` header.
+
+## How a run is stopped
+
+Before any money is reserved, one atomic Lua script ([app/lua/gate.lua](app/lua/gate.lua)) checks the run's circuit breaker:
+
+1. **Breaker OPEN:** the call is refused right away.
+2. **Step cap:** every call that gets past the breaker counts as a step. Call `step_cap + 1` opens the breaker with `reason=step_cap`.
+3. **Repeated request:** the last two messages are fingerprinted (sha256 of canonical JSON, with tool-call ids dropped and tool arguments re-serialized, so an agent re-sending the same tool call and the same failing result matches every turn). The `repeat_threshold`-th identical fingerprint in a run opens the breaker with `reason=loop`. Requests with fewer than two messages have no fingerprint.
+
+The call that opens the breaker is refused too, and a refused call reserves nothing and never reaches the upstream.
+
+After a successful response, the response side is checked as well. If the first tool call in the response (name plus canonical arguments) is the same as in the run's previous `consecutive_tool_calls - 1` responses, the breaker opens with `reason=loop` for the next call. A response without a tool call breaks the streak, and a cut stream doesn't count.
+
+An OPEN breaker stays open until an admin resets it (see [Admin](#admin)) or the run's keys expire with its budget.
 
 ## How a call is budgeted
 
@@ -84,6 +99,17 @@ Errors use OpenAI's error shape, so SDKs raise their usual exception types.
 
 `level` is `run`, `agent` or `team`. The `*_usd` values are floats for display only.
 
+**429 Breaker open** (loop or step cap). No request was sent upstream, and `x-should-retry: false` is set:
+
+```json
+{"error": {
+  "type": "agentmeter_breaker_open", "reason": "loop", "run_id": "ticket-4711",
+  "spent_usd": 0.000042, "steps": 4,
+  "message": "Circuit breaker open for run ticket-4711: ...", "param": null, "code": "loop_detected"}}
+```
+
+`reason` is `loop` (code `loop_detected`) or `step_cap` (code `step_cap_reached`). `spent_usd` is formatted as in the budget 429.
+
 **400 Bad request:**
 
 ```json
@@ -111,7 +137,18 @@ The first two are 502 (the upstream was never reached). The last is 504 (no resp
 data: {"error": {"type": "agentmeter_upstream_cut", "code": "upstream_cut", "message": "...", "param": null}}
 ```
 
-`code` is `upstream_cut`, `upstream_timeout` or `upstream_incomplete`.
+`code` is `upstream_cut`, `upstream_timeout` or `upstream_incomplete`. A stream whose budget reservation was lost ends the same way with `type: agentmeter_reservation_lost` (see the limitations).
+
+## Admin
+
+```bash
+curl -X POST localhost:8080/admin/runs/ticket-4711/reset -H "Authorization: Bearer $AGENTMETER_ADMIN_TOKEN"
+# {"run_id": "ticket-4711", "reset": true, "breaker_was": {"reason": "loop", ...}, "steps_was": 4}
+```
+
+The reset closes the run's breaker and clears its step count, request fingerprints and tool-call streak. It never touches money: `spent`, `reserved` and the limit stay as they are, so a run whose budget is exhausted is still refused with `reason=budget`.
+
+The endpoint is enabled only when `admin_token` is set (for example with `AGENTMETER_ADMIN_TOKEN`). Without one it returns 404. A missing or wrong bearer token gives 401.
 
 ## Configuration
 
@@ -132,6 +169,9 @@ budgets:
 loop:
   repeat_threshold: 3
   step_cap: 50
+  consecutive_tool_calls: 3
+  agents:            # per-agent overrides (X-AM-Agent), e.g. for a legitimate poller
+    status-poller: {repeat_threshold: 20, step_cap: 500}
 alerts:
   thresholds: [0.5, 0.75, 0.9]
   webhook_url: ${ALERT_WEBHOOK}
@@ -154,7 +194,12 @@ alerts:
 | `reservation_ttl_seconds` | `3600` | The sweeper releases an unsettled reservation this long after its last reserve or heartbeat. It must exceed `upstream_timeout_seconds`. |
 | `reservation_heartbeat_seconds` | `60` | How often a live stream extends its reservation. It must be less than `reservation_ttl_seconds`. |
 | `sweep_interval_seconds` | `30` | How often each replica sweeps expired reservations (up to 100 per batch). |
-| `loop.*`, `alerts.*` | see YAML | Parsed and validated, but not used yet (M3, M4). |
+| `loop.repeat_threshold` | `3` | The same request fingerprint this many times in a run opens the breaker (`loop`). At least 2. |
+| `loop.step_cap` | `50` | Calls allowed per run; call `step_cap + 1` opens the breaker (`step_cap`). |
+| `loop.consecutive_tool_calls` | `3` | The same tool call in this many responses in a row opens the breaker (`loop`) for the next call. At least 2. |
+| `loop.agents.<name>` | none | Overrides of the three `loop` values above for one agent. |
+| `admin_token` | unset | Bearer token for `POST /admin/runs/{id}/reset`. Unset or empty disables the endpoint (404). Prefer setting it with `AGENTMETER_ADMIN_TOKEN`. |
+| `alerts.*` | see YAML | Parsed and validated, but not used yet (M4). |
 
 `${VAR}` and `${VAR:-default}` placeholders in the YAML are filled from the environment. Every key can also be overridden with an `AGENTMETER_` variable, using `__` for nesting. For example: `AGENTMETER_UPSTREAM`, `AGENTMETER_REDIS_URL`, `AGENTMETER_BUDGETS__DEFAULT_RUN_USD=1.25`.
 
@@ -181,7 +226,7 @@ Upstream LLM API              Worker: threshold alerts → webhook
 (OpenAI / Gemini / LiteLLM)            Prometheus /metrics
 ```
 
-Steps 1, 4, 5 and 6 are implemented. Steps 2, 3 and 7, the worker and `/metrics` are planned.
+Steps 1 to 6 are implemented; steps 2 and 3 run as one atomic script, before the reserve. Step 7, the worker and `/metrics` are planned.
 
 Budget state in Redis (all values integer micro-USD):
 
@@ -192,8 +237,14 @@ Budget state in Redis (all values integer micro-USD):
 | `am:b:team:{team}:{YYYYMM}` | the same fields, per UTC month |
 | `am:r:{id}` | one in-flight reservation: `amount` and its level keys (a short-lived `settled` tombstone after settle) |
 | `am:resv` | sorted set of in-flight reservation ids, scored by expiry in Unix ms from Redis `TIME` |
+| `am:brk:{run_id}` | the run's breaker; present means OPEN: `reason`, `source`, `steps`, `opened_ms` |
+| `am:steps:{run_id}` | the run's step count |
+| `am:fp:{run_id}` | request fingerprint → times seen |
+| `am:tc:{run_id}` | the response tool-call streak: last fingerprint and count in a row |
 
-The scripts are in [app/lua/](app/lua/): `reserve`, `settle`, `extend` and `sweep`. Each runs atomically, so a settle and a sweep racing for the same reservation release it exactly once. The client and the full key documentation are in [app/budget.py](app/budget.py). The sweeper loop is in [app/sweeper.py](app/sweeper.py).
+The breaker keys expire together with the run's budget key.
+
+The scripts are in [app/lua/](app/lua/): `gate` and `toolcall` (the breaker, in [app/breaker.py](app/breaker.py)), and `reserve`, `settle`, `extend` and `sweep`. Each runs atomically, so a settle and a sweep racing for the same reservation release it exactly once. The client and the full key documentation are in [app/budget.py](app/budget.py). The sweeper loop is in [app/sweeper.py](app/sweeper.py).
 
 ## Status
 
@@ -204,7 +255,7 @@ The scripts are in [app/lua/](app/lua/): `reserve`, `settle`, `extend` and `swee
 | M2a: Pricing table and worst-case estimate | ✅ done |
 | M2b: Atomic reserve/settle across run ⊂ agent ⊂ team | ✅ done |
 | M2c: Reservation sweeper, stream heartbeat; 100-request concurrency test across 2 replicas | ✅ done |
-| M3: Loop detection, step cap, breaker state, admin reset | planned |
+| M3: Loop detection, step cap, breaker state, admin reset | ✅ done (the LangGraph demo moves to M6) |
 | M4: Redis Stream events, one-shot 50/75/90% alerts, webhook worker | planned |
 | M5: Prometheus metrics, `GET /runs/{id}` report | planned |
 | M6: Runaway-agent demo, benchmark, docs | planned |
@@ -221,6 +272,8 @@ Progress notes and design decisions are in [PROGRESS.md](PROGRESS.md). The full 
 - **A stream whose reservation is reclaimed is ended:** if a stream's heartbeat finds its reservation gone (Redis unreachable from that replica for longer than `reservation_ttl_seconds`), the stream ends with an `agentmeter_reservation_lost` error event at the next upstream chunk and settles from what was relayed.
 - **Reclaiming takes time:** a crashed call's reservation is held until `reservation_ttl_seconds` has passed and the next sweep runs. That blocks budget for up to an hour by default; it never allows overspend.
 - **`max_tokens` injection and o-series models:** the injected `max_tokens` is rejected by models that only accept `max_completion_tokens`. Set `max_completion_tokens` yourself for those.
+- **Loop detection is heuristic:** only the last two messages and the first tool call of a response are compared. A loop that alternates between three or more states, or varies an argument each time (a counter, a timestamp), is not detected; the step cap is the backstop for those. Polling agents that legitimately repeat should send `X-AM-Loop-Exempt: true` or get a per-agent override.
+- **Breaker state is per run only:** there is no agent-wide or team-wide breaker, and an OPEN breaker never closes on its own (no half-open state) before its keys expire with the run.
 - **Only `/v1/chat/completions`** is proxied. Other endpoints, including the Responses API and Anthropic's `/v1/messages`, are not.
 
 ## Demo
