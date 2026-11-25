@@ -2,7 +2,7 @@
 
 A budget circuit breaker for AI agents. AgentMeter is a drop-in, OpenAI-compatible proxy. It gives every agent run its own budget and refuses the call that would overspend it, before that call reaches the model.
 
-> Status: early development. Budgets work today (M2b). Loop detection, alerts and metrics are planned. See [Status](#status).
+> Status: early development. Budgets, loop detection, the circuit breaker and webhook alerts work today (M4). Metrics, the run report and the demo are planned. See [Status](#status).
 
 ## Why
 
@@ -12,7 +12,7 @@ Gateways such as LiteLLM and Portkey already budget per key, user or team. Agent
 
 1. **Budgets per run,** nested inside a daily agent budget and a monthly team budget.
 2. **Correct under concurrency:** parallel calls, across several proxy replicas, can't overspend. Each call reserves its worst-case cost atomically in Redis before it is forwarded, then settles with the real usage.
-3. **Loop detection and alerts** (planned): trip the breaker when an agent repeats itself, and warn at 50%, 75% and 90% of a budget.
+3. **Loop detection and alerts:** trip the breaker when an agent repeats itself, and warn once at 50%, 75% and 90% of each budget.
 
 It is not a full gateway. It has no routing, caching or key vault. You can put LiteLLM *behind* AgentMeter if you need those.
 
@@ -139,6 +139,33 @@ data: {"error": {"type": "agentmeter_upstream_cut", "code": "upstream_cut", "mes
 
 `code` is `upstream_cut`, `upstream_timeout` or `upstream_incomplete`. A stream whose budget reservation was lost ends the same way with `type: agentmeter_reservation_lost` (see the limitations).
 
+## Events and alerts
+
+Every state change worth knowing about is written to one Redis Stream, `am:events`, from inside the Lua script that makes the change. So an event exists exactly when the change happened, and a duplicate settle writes nothing.
+
+| `type` | Written by | Fields |
+|---|---|---|
+| `call_settled` | `settle.lua`, once per call | `run`, `agent`, `team`, `model`, `prompt_tokens`, `completion_tokens`, `cost_micro`, `estimate_micro`, `how` (`usage`, `tiktoken`, `estimate:*`, ...), `reservation`, `reservation_state` (`released` or `gone`) |
+| `threshold_crossed` | `settle.lua` | `level` (`run`, `agent`, `team`), `key`, `threshold_bp`, `spent`, `limit`, and the `run`, `agent`, `team` of the call that crossed it |
+| `breaker_open` | `gate.lua`, `toolcall.lua` | `run`, `agent`, `team`, `reason`, `source`, `steps`, `spent` |
+
+All values are strings: money in integer micro-USD, thresholds in integer basis points. The stream is capped with `XADD MAXLEN ~ events.stream_maxlen`.
+
+**Thresholds fire once.** After a settle adds its cost, the script checks every level the call touched against every threshold: `spent * 10000 >= limit * threshold_bp`, measured on `spent`, not `spent + reserved`. The check uses integers only and stays exact for any limit below 2^53 µUSD. A crossing is written only if `SET NX` on its flag (`am:alert:run:{id}:5000`, `am:alert:agent:{name}:{day}:7500`, ...) succeeds, so each (level, threshold) fires exactly once, however many replicas settle at the same moment. A flag expires with its budget key: the run TTL, or the end of the agent's day or team's month plus grace. A single call that jumps from 40% to 95% fires 50, 75 and 90 together.
+
+**The alert worker** ([worker/alerts.py](worker/alerts.py), the `worker` service in compose, or `python -m worker.alerts`) reads the stream in the consumer group `am:alerts`:
+
+- `threshold_crossed` and `breaker_open` are posted as Slack-compatible JSON, `{"text": "..."}`, to `alerts.webhook_url`. Other events are acknowledged without a post.
+- An entry is acknowledged (`XACK`) only after the webhook answers 2xx. A failed post stays pending and is retried once it has been idle for `alerts.retry_idle_seconds`, by this worker or any other (`XAUTOCLAIM`). Delivery is at least once.
+- Without a `webhook_url`, alerts are logged at WARNING and acknowledged.
+- The group is created on first start from the beginning of the stream, so alerts written before the worker ever ran are still delivered.
+
+Example post:
+
+```
+:warning: AgentMeter: run budget `run:ticket-4711` crossed 75%: spent $0.000056 of $0.00007 (last call: run `ticket-4711`)
+```
+
 ## Admin
 
 ```bash
@@ -175,6 +202,9 @@ loop:
 alerts:
   thresholds: [0.5, 0.75, 0.9]
   webhook_url: ${ALERT_WEBHOOK}
+  retry_idle_seconds: 30
+events:
+  stream_maxlen: 100000
 ```
 
 > **Check the prices.** The prices above are placeholders. Compare them with your provider's current price page before you rely on any budget. Prices change, and the table is the only source AgentMeter uses.
@@ -199,7 +229,11 @@ alerts:
 | `loop.consecutive_tool_calls` | `3` | The same tool call in this many responses in a row opens the breaker (`loop`) for the next call. At least 2. |
 | `loop.agents.<name>` | none | Overrides of the three `loop` values above for one agent. |
 | `admin_token` | unset | Bearer token for `POST /admin/runs/{id}/reset`. Unset or empty disables the endpoint (404). Prefer setting it with `AGENTMETER_ADMIN_TOKEN`. |
-| `alerts.*` | see YAML | Parsed and validated, but not used yet (M4). |
+| `alerts.thresholds` | `[0.5, 0.75, 0.9]` | Alert thresholds as ratios, stored as integer basis points. Strictly increasing, finer than 1 bp is rejected. |
+| `alerts.webhook_url` | unset | Slack-compatible incoming webhook for the worker. Unset or empty: alerts are only logged. |
+| `alerts.retry_idle_seconds` | `30` | A failed webhook post is retried once it has been pending this long. |
+| `alerts.webhook_timeout_seconds` | `10` | httpx timeout for one webhook post. |
+| `events.stream_maxlen` | `100000` | Approximate length cap of `am:events` (`XADD MAXLEN ~`). |
 
 `${VAR}` and `${VAR:-default}` placeholders in the YAML are filled from the environment. Every key can also be overridden with an `AGENTMETER_` variable, using `__` for nesting. For example: `AGENTMETER_UPSTREAM`, `AGENTMETER_REDIS_URL`, `AGENTMETER_BUDGETS__DEFAULT_RUN_USD=1.25`.
 
@@ -226,7 +260,7 @@ Upstream LLM API              Worker: threshold alerts → webhook
 (OpenAI / Gemini / LiteLLM)            Prometheus /metrics
 ```
 
-Steps 1 to 6 are implemented; steps 2 and 3 run as one atomic script, before the reserve. Step 7, the worker and `/metrics` are planned.
+Steps 1 to 7 and the alert worker are implemented; steps 2 and 3 run as one atomic script, before the reserve, and step 7 happens inside the settle and breaker scripts. `/metrics` is planned (M5).
 
 Budget state in Redis (all values integer micro-USD):
 
@@ -241,6 +275,8 @@ Budget state in Redis (all values integer micro-USD):
 | `am:steps:{run_id}` | the run's step count |
 | `am:fp:{run_id}` | request fingerprint → times seen |
 | `am:tc:{run_id}` | the response tool-call streak: last fingerprint and count in a row |
+| `am:alert:{level}:{id}:{bp}` | one-shot flag of a threshold that has fired; expires with its budget key |
+| `am:events` | the event stream (consumer group `am:alerts`) |
 
 The breaker keys expire together with the run's budget key.
 
@@ -256,7 +292,7 @@ The scripts are in [app/lua/](app/lua/): `gate` and `toolcall` (the breaker, in 
 | M2b: Atomic reserve/settle across run ⊂ agent ⊂ team | ✅ done |
 | M2c: Reservation sweeper, stream heartbeat; 100-request concurrency test across 2 replicas | ✅ done |
 | M3: Loop detection, step cap, breaker state, admin reset | ✅ done (the LangGraph demo moves to M6) |
-| M4: Redis Stream events, one-shot 50/75/90% alerts, webhook worker | planned |
+| M4: Redis Stream events, one-shot 50/75/90% alerts, webhook worker | ✅ done |
 | M5: Prometheus metrics, `GET /runs/{id}` report | planned |
 | M6: Runaway-agent demo, benchmark, docs | planned |
 
@@ -274,6 +310,8 @@ Progress notes and design decisions are in [PROGRESS.md](PROGRESS.md). The full 
 - **`max_tokens` injection and o-series models:** the injected `max_tokens` is rejected by models that only accept `max_completion_tokens`. Set `max_completion_tokens` yourself for those.
 - **Loop detection is heuristic:** only the last two messages and the first tool call of a response are compared. A loop that alternates between three or more states, or varies an argument each time (a counter, a timestamp), is not detected; the step cap is the backstop for those. Polling agents that legitimately repeat should send `X-AM-Loop-Exempt: true` or get a per-agent override.
 - **Breaker state is per run only:** there is no agent-wide or team-wide breaker, and an OPEN breaker never closes on its own (no half-open state) before its keys expire with the run.
+- **Alerts are at least once:** if the worker dies after the webhook accepted a post but before the `XACK`, that alert is posted again. An alert that keeps failing is retried every `retry_idle_seconds` with no limit and no dead-letter queue; an entry trimmed from the stream by `MAXLEN` while still pending is dropped.
+- **No alerts for reserved money:** thresholds are measured on `spent` only, so a burst of large in-flight reservations alerts only once those calls settle.
 - **Only `/v1/chat/completions`** is proxied. Other endpoints, including the Responses API and Anthropic's `/v1/messages`, are not.
 
 ## Demo

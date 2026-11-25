@@ -1,7 +1,7 @@
 # Progress
 
 ## Current milestone
-M3 is done. Next is M4: Redis Stream events, one-shot 50/75/90% alerts and the webhook worker. The LangGraph demo agent is deferred to M6.
+M4 is done. Next is M5: Prometheus metrics and the `GET /runs/{id}` report (built from the `call_settled` and `breaker_open` events). The LangGraph demo agent is deferred to M6.
 
 ## Done
 - M0 (2026-11-24): pyproject, FastAPI app with `GET /healthz` (pings Redis), config loader, example `agentmeter.yaml`, fake OpenAI `mock_upstream`, Dockerfiles, docker-compose (redis, mock_upstream, proxy), CI (ruff + pytest with a Redis service). `docker compose up` gives `/healthz` → `{"status":"ok","redis":true}`.
@@ -33,6 +33,21 @@ M3 is done. Next is M4: Redis Stream events, one-shot 50/75/90% alerts and the w
   - Breaking `>=` → `>` (threshold), `>` → `>=` (step cap), or keeping `tool_call_id` in fingerprints made 6, 4 and 5 tests fail respectively.
   - Compose smoke with the built image: identical calls gave `[200, 200, 429, 429]`, the 429 carried `x-should-retry: false` and `reason: loop`. Reset with a wrong token gave 401, with the right one 200, and the budget hash was unchanged (`spent=28`) and the run worked again. `X-AM-Loop-Exempt: true` let 3 identical calls through. Without a token configured, reset gave 404.
 - **M3 ✅** The scripted broken-tool agent is stopped after N repeats with `reason=loop`. (The LangGraph version of the demo is part of M6.)
+- M3 follow-ups (2026-11-26):
+  - The admin token was already compared with `hmac.compare_digest`.
+  - New test: A,B,A,B,A trips `reason=loop` on call 5. `gate.lua` already counted per fingerprint per run. Making it count consecutive repeats only made the new test fail while the older loop tests still passed.
+  - PLAN §3.3 notes that an exhausted budget answers 429 per call and doesn't open the breaker.
+- M4 (2026-11-26): events, one-shot alerts and the webhook worker.
+  - `am:events` stream (`app/events.py`). `call_settled` and `threshold_crossed` come from `settle.lua`, and `breaker_open` from `gate.lua` and `toolcall.lua`. The worker is `worker/alerts.py`, run as the compose `worker` service.
+  - `tests/test_alerts_concurrency.py`: 2 proxy replicas, waves of 30 concurrent calls over 3 runs sharing one agent and one team, until no call fits. Every level ends at ≥ 90% of its limit, and the stream holds exactly one `threshold_crossed` per (level key, threshold): 15 for 3 runs + agent + team. It passed 3 of 3 local runs and runs in the CI concurrency step.
+  - Deliberate breakages, each reverted from a backup copy:
+    - Dropping `NX` from the flag `SET` failed 5 tests, including the concurrency test on its own.
+    - `>=` → `>` failed 8.
+    - The naive `spent * 10000 >= limit * bp` in Lua doubles failed 1 (the beyond-2^53 limit test).
+    - A worker that acks before posting failed 3 worker tests.
+  - Compose smoke, with a webhook catcher on the host (`ALERT_WEBHOOK=http://host.docker.internal:9009/hook`): a 70 µUSD run, 5 calls of 14 µUSD, then a 429. The stream had 3 `threshold_crossed` (5000, 7500, 9000) among 5 `call_settled`, the catcher received exactly 3 posts (50%, 75%, 90%), and 0 were left pending.
+  - Retry in compose: with the catcher stopped, a second run's 3 alerts stayed pending and the worker logged 3 "will retry" warnings. After the catcher restarted, all 3 were delivered on retry, each once, and 0 were left pending.
+- **M4 ✅** 50/75/90 fire exactly once per level under concurrent load on 2 replicas, in CI. The worker delivers at least once with retry and acks only after success.
 
 ## Decisions
 - **Money parsing:** YAML and env values are in USD and converted to integer micro-USD via `Decimal(str(v))`. A value that isn't a whole number of micro-USD is rejected, not rounded. Prices are stored as micro-USD per 1M tokens (`input_per_mtok`, `output_per_mtok`). Model fields drop the `_usd` suffix (`budgets.default_run`, `agents[x].daily`) and use the YAML key as an alias, so `_usd` never labels a micro-USD int.
@@ -142,12 +157,34 @@ M3 is done. Next is M4: Redis Stream events, one-shot 50/75/90% alerts and the w
 - **Mock upstream:** `MOCK_TOOL_CALL` (JSON `{name, arguments}`) answers with that tool call and a fresh call id each time. Streaming sends id + name, then the arguments in two pieces, like OpenAI.
 - **Lost reservation mid-stream:** the heartbeat's result is checked once per upstream chunk, so an idle upstream ends the stream no later than its `upstream_timeout_seconds`.
 
+- **Events are written inside the scripts:** `call_settled` and `threshold_crossed` in `settle.lua`, `breaker_open` in `gate.lua` and `toolcall.lua`. An event therefore exists exactly when its state change happened (atomic with it), and a duplicate settle (`DUPLICATE`) writes nothing. The stream key and every flag key go through `KEYS`.
+  - Every XADD uses `MAXLEN ~ events.stream_maxlen` (default 100000). `~` lets Redis trim whole nodes, so the length is approximate.
+- **`call_settled` fields:** `run`, `agent`, `team`, `model`, `prompt_tokens`, `completion_tokens`, `cost_micro`, `estimate_micro`, `how`, `reservation`, `reservation_state` (`released`/`gone`).
+  - The tokens are the ones the cost was priced from: usage when it arrived, the worst case (estimated input + max output) for `estimate:*` settlements, estimated input + streamed tokens for `tiktoken`, and 0/0 for a 0 settle.
+  - `estimate_micro` and `how` go beyond the spec. M5 needs them for estimate-vs-actual.
+- **Threshold rule:** level `spent` after this settle's spend (not `spent + reserved`), `spent * 10000 >= limit * bp`, using the limit stored in the level hash.
+  - It's evaluated as `spent >= q*bp + ceil(r*bp/10000)` with `limit = q*10000 + r`, so it's exact with Lua doubles for any limit below 2^53. A randomized test checks it against the Python reference, at need−1, need and need+1, for limits up to 2^53.
+  - Thresholds are checked in increasing order and stop at the first one not reached. A level with no `limit` field (re-created mid-call) or limit 0 is skipped.
+- **Threshold flags:** `am:alert:{level key without am:b:}:{bp}`, set with `SET NX EXAT <the level's expiry>`.
+  - Agent and team flags expire with their period key.
+  - The run key's expiry slides with each reserve. So a settle that finds a flag already set pushes it to the run's current expiry with `EXPIREAT … GT` (beyond the spec), so a long run can't re-fire after its first TTL.
+- **Worker:**
+  - Consumer group `am:alerts`, created with `MKSTREAM` from id `0`, so alerts emitted before the first worker started are delivered.
+  - Each loop: `XAUTOCLAIM` (min idle `alerts.retry_idle_seconds`, default 30, cursor kept between loops), then `XREADGROUP >` with `BLOCK 5000`, both in batches of 50.
+  - Alert types are posted as `{"text": ...}` and acked only on 2xx. HTTP errors and non-2xx leave the entry pending. Non-alert events are acked straight away. Without a webhook URL, alerts are logged at WARNING and acked. An entry trimmed by MAXLEN while pending is reported deleted by XAUTOCLAIM and dropped.
+  - The consumer name is `AGENTMETER_WORKER_NAME` or the hostname (stable for a container across restarts). Any number of workers can share the group.
+- **Alert text:** money is formatted from integer micro-USD without floats (`$0.000056`, `$20.00`), and thresholds from bp (`75%`, `12.5%`).
+- **Packaging:** `worker` is a package next to `app` (in `pyproject.toml` and the Dockerfile). The compose `worker` service runs `python -m worker.alerts` from the proxy image, with `ALERT_WEBHOOK` passed through.
+
 ## Open questions
 - **o-series models:** they reject `max_tokens` and require `max_completion_tokens`. Should we inject `max_completion_tokens` for them, or for everyone (OpenAI's newer name, but less supported by OpenAI-compatible upstreams)?
 - **Image tokens:** the image estimate is a flat constant. gpt-4o-mini bills images at roughly 33× the token count, so 1105 can under-count there. We need a per-model image formula before relying on budgets with vision.
 - **Heartbeat lost for longer than the TTL:** resolved in the M2 follow-ups: such a stream is now ended with `agentmeter_reservation_lost`. The overspend is bounded to what was generated before the next chunk.
 - **Loop detection coverage:** only the last two messages and the first response tool call are compared. Alternating loops (A, B, A, B) and loops whose arguments carry a counter or timestamp slip through, with the step cap as the backstop. Should M3+ add a short history (last N fingerprints) or argument masking?
 - **Breaker auto-close:** an OPEN breaker stays open until reset or run expiry. Is a half-open state (allow one probe after a cool-down) wanted for `step_cap`, or never?
+- **Poison alerts:** an alert whose post keeps failing is retried forever (every `retry_idle_seconds`), with no attempt limit or dead-letter stream. Should we cap deliveries (XPENDING has the delivery count) and park failures somewhere?
+- **Duplicate posts:** delivery is at least once. A worker killed between the webhook's 2xx and the XACK posts that alert again. Slack has no idempotency key; is that acceptable, or should the text carry the stream id so duplicates are recognizable?
+- **Alerts on reserved money:** thresholds use `spent` only (per spec). A run with large in-flight reservations can be close to its limit without any alert until they settle. Should there be an optional `spent + reserved` early warning?
 - **Admin auth:** a single static bearer token. Is that enough for v1, or do we need per-operator tokens and an audit trail (the reset is only logged at WARNING)?
 - **Period boundaries:** day and month key names still come from each replica's clock (NTP assumed). Moving them to Redis `TIME` would mean computing the key names inside the script, which breaks the declared-`KEYS` contract further. Worth it?
 - **Failed settle loses the cost:** when settle itself fails (Redis blip), the sweeper releases the reservation but the actual cost is never added to `spent`. Should the proxy retry settles from a local queue?
