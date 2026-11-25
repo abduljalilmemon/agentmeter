@@ -27,6 +27,7 @@ from tests.conftest import make_settings, serve
 pytestmark = [pytest.mark.concurrency, pytest.mark.usefixtures("redis_db")]
 
 CALLS = 100
+NO_STEP_CAP = {"step_cap": 10_000}  # these tests are about money; 100 calls > default cap
 FITS = 10
 BODY = {
     "model": "gpt-4o-mini",
@@ -52,7 +53,7 @@ async def _fire(urls: list[str], headers: dict[str, str]) -> list[httpx.Response
 def test_100_calls_2_replicas_exactly_10_fit(
     redis_db: redis.Redis, live_mock: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    settings = make_settings(live_mock)
+    settings = make_settings(live_mock, loop=NO_STEP_CAP)
     est = estimate(PriceTable(settings.pricing), BODY["model"], BODY, settings.default_max_tokens)
     monkeypatch.setenv("MOCK_PROMPT_TOKENS", str(est.input_tokens))
     monkeypatch.setenv("MOCK_COMPLETION_TOKENS", str(est.max_output_tokens))
@@ -97,7 +98,7 @@ def test_usage_below_estimate_spent_is_exact_sum(
 ) -> None:
     """Mock usage (8 in, 20 out: 14 µUSD) is far below the estimate (62). Settles then
     return headroom while other calls are in flight; spent must still be the exact sum."""
-    settings = make_settings(live_mock)
+    settings = make_settings(live_mock, loop=NO_STEP_CAP)
     monkeypatch.setenv("MOCK_PROMPT_TOKENS", "8")
     monkeypatch.setenv("MOCK_COMPLETION_TOKENS", "20")
     monkeypatch.setenv("MOCK_DELAY_MS", "20")

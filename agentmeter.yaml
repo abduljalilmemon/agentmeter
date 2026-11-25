@@ -13,8 +13,11 @@ budgets:
   teams:
     platform: {monthly_usd: 500}
 loop:
-  repeat_threshold: 3
-  step_cap: 50
+  repeat_threshold: 3        # same request fingerprint N times in a run -> breaker opens (loop)
+  step_cap: 50               # call 51 of a run -> breaker opens (step_cap)
+  consecutive_tool_calls: 3  # same tool call in K responses in a row -> opens (loop)
+  agents: {}                 # per-agent overrides, e.g. status-poller: {repeat_threshold: 20}
+# admin_token: set AGENTMETER_ADMIN_TOKEN to enable POST /admin/runs/{id}/reset
 alerts:
   thresholds: [0.5, 0.75, 0.9]
   webhook_url: ${ALERT_WEBHOOK}

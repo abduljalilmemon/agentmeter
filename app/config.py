@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated, Any
@@ -26,6 +27,7 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    SecretStr,
     field_validator,
     model_validator,
 )
@@ -81,9 +83,40 @@ class Budgets(_Model):
     teams: dict[str, TeamBudget] = Field(default_factory=dict)
 
 
+class LoopOverride(_Model):
+    """Per-agent loop settings (PLAN §9: legitimate polling agents need looser limits)."""
+
+    repeat_threshold: int | None = Field(default=None, ge=2)
+    step_cap: int | None = Field(default=None, ge=1)
+    consecutive_tool_calls: int | None = Field(default=None, ge=2)
+
+
+@dataclass(frozen=True, slots=True)
+class LoopLimits:
+    repeat_threshold: int
+    step_cap: int
+    consecutive_tool_calls: int
+
+
 class LoopConfig(_Model):
+    # The same request fingerprint this many times in one run opens the breaker (loop).
     repeat_threshold: int = Field(default=3, ge=2)
+    # Calls allowed per run; call step_cap + 1 opens the breaker (step_cap).
     step_cap: int = Field(default=50, ge=1)
+    # The same tool call in this many responses in a row opens the breaker (loop).
+    consecutive_tool_calls: int = Field(default=3, ge=2)
+    agents: dict[str, LoopOverride] = Field(default_factory=dict)
+
+    def limits_for(self, agent: str | None) -> LoopLimits:
+        override = self.agents.get(agent) if agent else None
+
+        def pick(name: str) -> int:
+            value = getattr(override, name, None) if override else None
+            return value if value is not None else getattr(self, name)
+
+        return LoopLimits(
+            pick("repeat_threshold"), pick("step_cap"), pick("consecutive_tool_calls")
+        )
 
 
 BPS_PER_UNIT = 10_000
@@ -149,6 +182,8 @@ class Settings(BaseSettings):
     budgets: Budgets = Field(default_factory=Budgets)
     loop: LoopConfig = Field(default_factory=LoopConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
+    # Bearer token for /admin/*. Unset (or empty) disables the admin endpoints (404).
+    admin_token: SecretStr | None = None
     # A run's budget key lives this long after its last reserve.
     run_ttl_seconds: int = Field(default=7 * 86_400, gt=0)
     # An unsettled reservation is released by the sweeper this long after its last
@@ -158,6 +193,11 @@ class Settings(BaseSettings):
     reservation_heartbeat_seconds: float = Field(default=60.0, gt=0)
     # How often each replica sweeps expired reservations.
     sweep_interval_seconds: float = Field(default=30.0, gt=0)
+
+    @field_validator("admin_token", mode="before")
+    @classmethod
+    def _empty_token_is_none(cls, v: Any) -> Any:
+        return None if v is None or (isinstance(v, str) and not v.strip()) else v
 
     @model_validator(mode="after")
     def _reservation_outlives_calls(self) -> Settings:

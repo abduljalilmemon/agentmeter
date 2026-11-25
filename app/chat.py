@@ -17,10 +17,12 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
 from app import proxy
+from app.breaker import BreakerClient, GateResult
 from app.budget import BudgetClient, Rejection, Reservation, SettleResult
 from app.config import MICRO_PER_USD, Settings
 from app.estimate import Estimate, EstimateError, count_text_tokens, estimate
 from app.identity import Identity
+from app.loops import first_tool_call, request_fingerprint, tool_call_fingerprint
 from app.pricing import PriceTable, UnknownModel
 
 log = logging.getLogger("agentmeter")
@@ -117,6 +119,40 @@ def budget_exhausted(identity: Identity, rejection: Rejection) -> JSONResponse:
     return response
 
 
+_BREAKER_CODES = {"loop": "loop_detected", "step_cap": "step_cap_reached"}
+_BREAKER_MESSAGES = {
+    "loop": "the run repeated itself (same request or same tool call over and over)",
+    "step_cap": "the run reached its step cap",
+}
+
+
+def breaker_open(identity: Identity, gate: GateResult) -> JSONResponse:
+    """The PLAN §3.3 429 for an OPEN breaker. Money is formatted as in budget_exhausted."""
+    reason = gate.reason or "loop"
+    response = JSONResponse(
+        status_code=429,
+        content={
+            "error": {
+                "message": (
+                    f"Circuit breaker open for run {identity.run_id}: "
+                    f"{_BREAKER_MESSAGES.get(reason, reason)}. Spent so far "
+                    f"{_usd(gate.spent)} USD. An admin can reset it with "
+                    f"POST /admin/runs/{identity.run_id}/reset"
+                ),
+                "type": "agentmeter_breaker_open",
+                "reason": reason,
+                "run_id": identity.run_id,
+                "spent_usd": _usd(gate.spent),
+                "steps": gate.steps,
+                "param": None,
+                "code": _BREAKER_CODES.get(reason, "breaker_open"),
+            }
+        },
+    )
+    response.headers["x-should-retry"] = "false"
+    return response
+
+
 class _Settlement:
     """Settles one reservation exactly once, even across cancellation."""
 
@@ -180,26 +216,60 @@ async def _heartbeat(
             return True
 
 
-def _usage_from(response: Response) -> dict[str, Any] | None:
+def _json_body(response: Response) -> dict[str, Any] | None:
     try:
-        usage = json.loads(response.body).get("usage")
+        body = json.loads(response.body)
     except (ValueError, AttributeError):
         return None
+    return body if isinstance(body, dict) else None
+
+
+def _usage_from(body: dict[str, Any] | None) -> dict[str, Any] | None:
+    usage = body.get("usage") if body else None
     return usage if isinstance(usage, dict) else None
 
 
+async def _track_tool_call(
+    breaker: BreakerClient, identity: Identity, call: tuple[str, Any] | None
+) -> None:
+    """Response-side loop check (PLAN §3.2): K identical tool calls in a row open it."""
+    if identity.loop_exempt:
+        return
+    fingerprint = tool_call_fingerprint(*call) if call else None
+    with anyio.CancelScope(shield=True):
+        try:
+            count, opened = await breaker.record_tool_call(
+                identity.run_id, identity.agent, fingerprint
+            )
+        except (redis.RedisError, OSError) as exc:
+            log.warning("tool-call loop check failed run_id=%s: %r", identity.run_id, exc)
+            return
+    if opened:
+        log.warning(
+            "breaker opened run_id=%s reason=loop source=response_tool_calls count=%d",
+            identity.run_id,
+            count,
+        )
+
+
 async def _settle_forwarded(
-    settle: _Settlement, ctx: CallContext, forwarded: proxy.Forwarded
+    settle: _Settlement,
+    ctx: CallContext,
+    forwarded: proxy.Forwarded,
+    breaker: BreakerClient | None = None,
 ) -> None:
     status = forwarded.response.status_code
     match forwarded.outcome:
         case proxy.Outcome.OK:
-            actual = ctx.actual_micro(_usage_from(forwarded.response))
+            body = _json_body(forwarded.response)
+            actual = ctx.actual_micro(_usage_from(body))
             if actual is None:
                 log.warning("2xx without usable usage; settling the estimate")
                 await settle(ctx.estimate_micro, "estimate:no_usage", status=status)
             else:
                 await settle(actual, "usage", status=status)
+            if breaker is not None:
+                await _track_tool_call(breaker, ctx.identity, first_tool_call(body))
         case proxy.Outcome.UPSTREAM_ERROR | proxy.Outcome.UNREACHABLE:
             await settle(0, forwarded.outcome.value, status=status)
         case proxy.Outcome.TIMEOUT:
@@ -245,6 +315,28 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
         return proxy.openai_error(400, str(exc), "invalid_request_error")
     ctx = CallContext(identity=identity, model=model, estimate=est, prices=prices)
 
+    # Breaker, step cap and request-loop check: one atomic script, before any reserve.
+    breaker: BreakerClient = request.app.state.breaker
+    fingerprint = None if identity.loop_exempt else request_fingerprint(body.get("messages"))
+    try:
+        gate = await breaker.gate(identity.run_id, identity.agent, fingerprint)
+    except (redis.RedisError, OSError):
+        log.exception("breaker check failed run_id=%s", identity.run_id)
+        return proxy.openai_error(
+            503, "Budget store unavailable", "agentmeter_budget_unavailable", "budget_unavailable"
+        )
+    if not gate.allowed:
+        log.log(
+            logging.WARNING if gate.opened_now else logging.INFO,
+            "breaker %s run_id=%s reason=%s steps=%d repeats=%d",
+            "opened" if gate.opened_now else "open",
+            identity.run_id,
+            gate.reason,
+            gate.steps,
+            gate.repeats,
+        )
+        return breaker_open(identity, gate)
+
     try:
         reserved = await budget.reserve(identity, est.micro)
     except (redis.RedisError, OSError):
@@ -277,12 +369,14 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
                 request.headers.items(),
                 params=request.query_params,
             )
-            await _settle_forwarded(settle, ctx, forwarded)
+            await _settle_forwarded(settle, ctx, forwarded, breaker)
             return forwarded.response
 
         async def on_finish(result: proxy.StreamResult) -> None:
             actual, how = ctx.stream_cost(result)
             await settle(actual, how, done=result.done, error=result.error)
+            if not result.cut:  # only a complete response says what the model decided
+                await _track_tool_call(breaker, identity, result.first_tool_call())
             await observer(ctx, result)
 
         forwarded = await proxy.forward_stream(

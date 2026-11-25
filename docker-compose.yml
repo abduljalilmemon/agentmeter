@@ -31,6 +31,7 @@ services:
       AGENTMETER_REDIS_URL: redis://redis:6379/0
       AGENTMETER_UPSTREAM: http://mock_upstream:8000/v1
       ALERT_WEBHOOK: ${ALERT_WEBHOOK:-}
+      AGENTMETER_ADMIN_TOKEN: ${AGENTMETER_ADMIN_TOKEN:-}
     depends_on:
       redis:
         condition: service_healthy

@@ -8,6 +8,8 @@ Env vars (read per request, so tests can change them):
   MOCK_STREAM_CUT         if "1", a streamed response drops the connection after the
                           content chunks, before the usage chunk and [DONE]
   MOCK_DELAY_MS           default 0; wait this long before answering (lets calls overlap)
+  MOCK_TOOL_CALL          if set, JSON {"name": ..., "arguments": {...} or "..."}: answer
+                          with that tool call (a fresh call id each time) instead of text
 
 GET /_mock/last_request returns the headers and JSON body of the last chat request,
 so tests can check what the proxy forwarded.
@@ -56,6 +58,21 @@ def _content() -> str:
     return os.environ.get("MOCK_CONTENT", "Hello from mock_upstream.")
 
 
+def _tool_call() -> dict[str, Any] | None:
+    raw = os.environ.get("MOCK_TOOL_CALL")
+    if not raw:
+        return None
+    spec = json.loads(raw)
+    arguments = spec.get("arguments", {})
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments)
+    return {
+        "id": f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {"name": spec["name"], "arguments": arguments},
+    }
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -95,32 +112,39 @@ async def chat_completions(request: Request) -> dict[str, Any] | JSONResponse | 
     model = body.get("model", "mock-model")
     created = int(time.time())
 
+    tool_call = _tool_call()
     if body.get("stream"):
         include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
         cut = os.environ.get("MOCK_STREAM_CUT") == "1"
         return StreamingResponse(
-            _stream(completion_id, model, created, include_usage, cut),
+            _stream(completion_id, model, created, include_usage, cut, tool_call),
             media_type="text/event-stream",
         )
+
+    if tool_call is not None:
+        message: dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": [tool_call]}
+        finish_reason = "tool_calls"
+    else:
+        message = {"role": "assistant", "content": _content()}
+        finish_reason = "stop"
 
     return {
         "id": completion_id,
         "object": "chat.completion",
         "created": created,
         "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": _content()},
-                "finish_reason": "stop",
-            }
-        ],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         "usage": _usage(),
     }
 
 
 async def _stream(
-    completion_id: str, model: str, created: int, include_usage: bool, cut: bool
+    completion_id: str,
+    model: str,
+    created: int,
+    include_usage: bool,
+    cut: bool,
+    tool_call: dict[str, Any] | None = None,
 ) -> AsyncIterator[bytes]:
     def event(choices: list[dict[str, Any]], **extra: Any) -> bytes:
         chunk = {
@@ -135,11 +159,22 @@ async def _stream(
 
     # OpenAI sends usage: null on every chunk but the last when include_usage is set.
     nulls = {"usage": None} if include_usage else {}
-    pieces = re.findall(r"\S+\s*", _content()) or [""]
     yield event([{"index": 0, "delta": {"role": "assistant", "content": ""}}], **nulls)
-    for piece in pieces:
-        yield event([{"index": 0, "delta": {"content": piece}, "finish_reason": None}], **nulls)
-    yield event([{"index": 0, "delta": {}, "finish_reason": "stop"}], **nulls)
+    if tool_call is not None:
+        # Like OpenAI: id + name first, then the arguments in pieces.
+        fn = tool_call["function"]
+        head = {**tool_call, "index": 0, "function": {"name": fn["name"], "arguments": ""}}
+        yield event([{"index": 0, "delta": {"tool_calls": [head]}}], **nulls)
+        args = fn["arguments"]
+        for piece in (args[: len(args) // 2], args[len(args) // 2 :]):
+            delta = {"tool_calls": [{"index": 0, "function": {"arguments": piece}}]}
+            yield event([{"index": 0, "delta": delta}], **nulls)
+        yield event([{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], **nulls)
+    else:
+        for piece in re.findall(r"\S+\s*", _content()) or [""]:
+            delta = {"content": piece}
+            yield event([{"index": 0, "delta": delta, "finish_reason": None}], **nulls)
+        yield event([{"index": 0, "delta": {}, "finish_reason": "stop"}], **nulls)
     if cut:
         raise StreamCut("MOCK_STREAM_CUT")
     if include_usage:

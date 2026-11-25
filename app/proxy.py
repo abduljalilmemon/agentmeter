@@ -148,6 +148,16 @@ class StreamResult:
     client_disconnected: bool = False
     # tiktoken count of the generated deltas relayed so far; settles a stream with no usage.
     streamed_output_tokens: int = 0
+    # The first tool call (choice 0, tool call 0), assembled from its deltas, for the
+    # response-side loop check. Arguments are capped at MAX_TOOL_CALL_ARGS_BYTES.
+    tool_call_name: str | None = None
+    tool_call_args: str = ""
+    tool_call_truncated: bool = False
+
+    def first_tool_call(self) -> tuple[str, str] | None:
+        if self.tool_call_name is None or self.tool_call_truncated:
+            return None
+        return self.tool_call_name, self.tool_call_args
 
     @property
     def cut(self) -> bool:
@@ -159,6 +169,29 @@ TokenCounter = Callable[[str], int]
 # Runs alongside the relay for as long as the stream is open; cancelled when it ends.
 # Returning True means the stream must stop (its budget reservation is gone).
 Keepalive = Callable[[], Awaitable[bool]]
+
+
+MAX_TOOL_CALL_ARGS_BYTES = 256 * 1024
+
+
+def _first_tool_call_delta(event: dict[str, Any]) -> tuple[str | None, str]:
+    """Name and argument piece for choice 0 / tool call 0 in one chunk, if any."""
+    for choice in event.get("choices") or ():
+        if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+            continue
+        delta = choice.get("delta")
+        calls = delta.get("tool_calls") if isinstance(delta, dict) else None
+        for call in calls or ():
+            if not isinstance(call, dict) or call.get("index", 0) != 0:
+                continue
+            function = call.get("function")
+            if isinstance(function, dict):
+                name = function.get("name")
+                args = function.get("arguments")
+                return (name if isinstance(name, str) else None), (
+                    args if isinstance(args, str) else ""
+                )
+    return None, ""
 
 
 def _delta_texts(event: dict[str, Any]) -> Iterator[str]:
@@ -199,6 +232,8 @@ class SSERelay:
         self._usage: dict[str, Any] | None = None
         self._done = False
         self._tokens = 0
+        self._tc_name: str | None = None
+        self._tc_args: list[str] = []
         self._oversized = False
 
     def feed(self, chunk: bytes) -> bytes:
@@ -218,6 +253,7 @@ class SSERelay:
             self._line_buf = b""
             self._oversized = True
             self._usage, self._done, self._tokens = None, False, 0
+            self._tc_name, self._tc_args = None, []
         return bytes(out)
 
     def flush(self) -> bytes:
@@ -250,7 +286,15 @@ class SSERelay:
         if self._done:
             self._result.done = True
         self._result.streamed_output_tokens += self._tokens
+        result = self._result
+        if self._tc_name and result.tool_call_name is None:
+            result.tool_call_name = self._tc_name
+        if self._tc_args and not result.tool_call_truncated:
+            result.tool_call_args += "".join(self._tc_args)
+            if len(result.tool_call_args) > MAX_TOOL_CALL_ARGS_BYTES:
+                result.tool_call_args, result.tool_call_truncated = "", True
         self._usage, self._done, self._tokens = None, False, 0
+        self._tc_name, self._tc_args = None, []
 
     def _line(self, line: bytes) -> None:
         if not line.startswith(b"data:"):
@@ -269,6 +313,11 @@ class SSERelay:
             self._usage = event["usage"]
         if self._count is not None:
             self._tokens += sum(self._count(text) for text in _delta_texts(event))
+        name, args = _first_tool_call_delta(event)
+        if name:
+            self._tc_name = self._tc_name or name
+        if args:
+            self._tc_args.append(args)
 
 
 def sse_error_event(message: str, err_type: str, code: str | None) -> bytes:

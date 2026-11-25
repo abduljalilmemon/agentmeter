@@ -13,6 +13,8 @@ RUN_ID_HEADER = "X-AM-Run-Id"
 AGENT_HEADER = "X-AM-Agent"
 TEAM_HEADER = "X-AM-Team"
 RUN_BUDGET_HEADER = "X-AM-Run-Budget"
+LOOP_EXEMPT_HEADER = "X-AM-Loop-Exempt"  # PLAN §9: skips loop fingerprints, not the step cap
+_BOOLS = {"true": True, "1": True, "false": False, "0": False}
 
 # Identity values become Redis key parts later, so keep them to a safe charset.
 _ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -31,6 +33,12 @@ class Identity:
     team: str | None
     run_budget: int | None  # micro-USD; None means "use the configured default"
     run_id_generated: bool
+    loop_exempt: bool = False
+
+
+def is_valid_id(value: str) -> bool:
+    """Run ids, agents and teams become Redis key parts: same charset everywhere."""
+    return bool(_ID_RE.fullmatch(value))
 
 
 def _id_header(headers: Mapping[str, str], name: str) -> str | None:
@@ -64,4 +72,15 @@ def parse_identity(headers: Mapping[str, str]) -> Identity:
         team=_id_header(headers, TEAM_HEADER),
         run_budget=budget,
         run_id_generated=generated,
+        loop_exempt=_bool_header(headers, LOOP_EXEMPT_HEADER),
     )
+
+
+def _bool_header(headers: Mapping[str, str], name: str) -> bool:
+    value = headers.get(name)
+    if value is None:
+        return False
+    try:
+        return _BOOLS[value.strip().lower()]
+    except KeyError:
+        raise IdentityError(name, f"{name} must be true or false") from None
