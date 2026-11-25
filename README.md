@@ -63,6 +63,8 @@ Ids and names must match `[A-Za-z0-9._:-]{1,128}`. All `X-AM-*` headers are remo
    - **Upstream error or connection failure:** settles 0.
    - **Read timeout:** settles the full estimate, because the provider may have billed it.
    - **Cut stream:** settles the estimated input plus a tiktoken count of the streamed output.
+   - **Client disconnects mid-stream before usage arrives:** settles the full estimate, because the upstream may have kept generating tokens the proxy never saw.
+5. **Reclaim:** a sweeper on every replica releases reservations whose calls never settled (a crash, a killed replica). A live stream sends a heartbeat that keeps its reservation from being swept, however long it runs.
 
 Money is stored as integer micro-USD everywhere, and costs round up, never down.
 
@@ -149,7 +151,9 @@ alerts:
 | `image_part_tokens` | `1105` | Flat token count per image in the estimate. |
 | `upstream_timeout_seconds` | `600` | httpx timeout for upstream calls. |
 | `run_ttl_seconds` | `604800` (7 days) | A run's budget is forgotten this long after its last call. |
-| `reservation_ttl_seconds` | `3600` | An unsettled reservation expires after this long. It must exceed `upstream_timeout_seconds`. |
+| `reservation_ttl_seconds` | `3600` | The sweeper releases an unsettled reservation this long after its last reserve or heartbeat. It must exceed `upstream_timeout_seconds`. |
+| `reservation_heartbeat_seconds` | `60` | How often a live stream extends its reservation. It must be less than `reservation_ttl_seconds`. |
+| `sweep_interval_seconds` | `30` | How often each replica sweeps expired reservations (up to 100 per batch). |
 | `loop.*`, `alerts.*` | see YAML | Parsed and validated, but not used yet (M3, M4). |
 
 `${VAR}` and `${VAR:-default}` placeholders in the YAML are filled from the environment. Every key can also be overridden with an `AGENTMETER_` variable, using `__` for nesting. For example: `AGENTMETER_UPSTREAM`, `AGENTMETER_REDIS_URL`, `AGENTMETER_BUDGETS__DEFAULT_RUN_USD=1.25`.
@@ -186,9 +190,10 @@ Budget state in Redis (all values integer micro-USD):
 | `am:b:run:{run_id}` | `limit`, `spent`, `reserved`; expires `run_ttl_seconds` after the last call |
 | `am:b:agent:{agent}:{YYYYMMDD}` | the same fields, per UTC day |
 | `am:b:team:{team}:{YYYYMM}` | the same fields, per UTC month |
-| `am:resv:{id}` | one in-flight reservation: `amount` and its level keys |
+| `am:r:{id}` | one in-flight reservation: `amount` and its level keys (a short-lived `settled` tombstone after settle) |
+| `am:resv` | sorted set of in-flight reservation ids, scored by expiry in Unix ms from Redis `TIME` |
 
-The scripts are in [app/lua/](app/lua/). The client and the full key documentation are in [app/budget.py](app/budget.py).
+The scripts are in [app/lua/](app/lua/): `reserve`, `settle`, `extend` and `sweep`. Each runs atomically, so a settle and a sweep racing for the same reservation release it exactly once. The client and the full key documentation are in [app/budget.py](app/budget.py). The sweeper loop is in [app/sweeper.py](app/sweeper.py).
 
 ## Status
 
@@ -198,7 +203,7 @@ The scripts are in [app/lua/](app/lua/). The client and the full key documentati
 | M1: Pass-through proxy, non-streaming and SSE streaming | ✅ done |
 | M2a: Pricing table and worst-case estimate | ✅ done |
 | M2b: Atomic reserve/settle across run ⊂ agent ⊂ team | ✅ done |
-| M2c: Reservation sweeper; 100-request concurrency test across 2 replicas | planned |
+| M2c: Reservation sweeper, stream heartbeat; 100-request concurrency test across 2 replicas | ✅ done |
 | M3: Loop detection, step cap, breaker state, admin reset | planned |
 | M4: Redis Stream events, one-shot 50/75/90% alerts, webhook worker | planned |
 | M5: Prometheus metrics, `GET /runs/{id}` report | planned |
@@ -211,7 +216,8 @@ Progress notes and design decisions are in [PROGRESS.md](PROGRESS.md). The full 
 - **Flat image tokens:** every image part counts as `image_part_tokens`, whatever its size or detail. Some models (for example gpt-4o-mini) bill images at many times that, so budgets for vision requests can under-estimate.
 - **Cached tokens are charged in full:** prompt-cache discounts are ignored, so the recorded spend can be higher than the invoice (never lower).
 - **Single Redis node:** one request's keys span several hash slots, so Redis Cluster is not supported. Use a single primary, with replicas for failover if you need them.
-- **No sweeper yet:** if a reservation expires unsettled (a crash, or a stream longer than `reservation_ttl_seconds`), its amount stays in `reserved` until the M2c sweeper exists. This blocks budget; it never allows overspend.
+- **Clocks:** reservation expiry uses the Redis clock (`TIME` inside the scripts), so replicas never disagree about it. Day and month budget keys are named from each replica's own clock, so replicas should be NTP-synced. With skew, a call made near midnight UTC can land in a different day's key depending on which replica serves it.
+- **Reclaiming takes time:** a crashed call's reservation is held until `reservation_ttl_seconds` has passed and the next sweep runs. That blocks budget for up to an hour by default; it never allows overspend.
 - **`max_tokens` injection and o-series models:** the injected `max_tokens` is rejected by models that only accept `max_completion_tokens`. Set `max_completion_tokens` yourself for those.
 - **Only `/v1/chat/completions`** is proxied. Other endpoints, including the Responses API and Anthropic's `/v1/messages`, are not.
 
