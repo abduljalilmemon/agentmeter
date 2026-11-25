@@ -41,6 +41,7 @@ from __future__ import annotations
 import calendar
 import enum
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -48,6 +49,7 @@ from pathlib import Path
 import redis.asyncio as redis
 
 from app.config import Settings
+from app.events import STREAM_KEY, threshold_flag_key
 from app.identity import Identity
 
 PERIOD_GRACE_SECONDS = 2 * 86_400  # keep yesterday's / last month's numbers readable
@@ -98,6 +100,10 @@ class Reservation:
     id: str
     amount: int  # micro-USD
     levels: tuple[Level, ...]
+    # Who made it: copied into the call_settled / threshold_crossed events.
+    run_id: str = ""
+    agent: str | None = None
+    team: str | None = None
 
     @property
     def key(self) -> str:
@@ -187,7 +193,9 @@ class BudgetClient:
         if estimate < 0:
             raise ValueError("estimate must be >= 0")
         levels = self.levels(identity, now)
-        reservation = Reservation(uuid.uuid4().hex, estimate, levels)
+        reservation = Reservation(
+            uuid.uuid4().hex, estimate, levels, identity.run_id, identity.agent, identity.team
+        )
         args: list[int | str] = [reservation.id, estimate, self._ttl_ms]
         for level in levels:
             args += [level.limit, level.expire_at, "1" if level.fixed_limit else "0"]
@@ -202,18 +210,46 @@ class BudgetClient:
             return Rejection(levels[index - 1], spent, reserved, limit, estimate)
         raise RuntimeError(f"reservation id collision: {reservation.id}")
 
-    async def settle(self, reservation: Reservation, actual: int) -> SettleResult:
-        """Release the reservation and add ``actual``. Safe to call more than once."""
+    async def settle(
+        self,
+        reservation: Reservation,
+        actual: int,
+        details: Mapping[str, str | int] | None = None,
+    ) -> SettleResult:
+        """Release the reservation and add ``actual``. Safe to call more than once.
+
+        Atomically with the settle, emits ``call_settled`` (with ``details`` as extra
+        fields: model, tokens, ...) and a ``threshold_crossed`` for every alert
+        threshold a level's ``spent`` reached for the first time.
+        """
         if actual < 0:
             raise ValueError("actual cost must be >= 0")
+        levels = reservation.levels
+        thresholds = self._settings.alerts.thresholds_bps
+        flags = [threshold_flag_key(lv.key, bp) for lv in levels for bp in thresholds]
+        args: list[str | int] = [
+            reservation.id,
+            actual,
+            self._ttl_ms,  # tombstone lifetime
+            self._settings.events.stream_maxlen,
+            len(levels),
+            len(thresholds),
+            *thresholds,
+        ]
+        for lv in levels:
+            args += [lv.name, lv.expire_at]
+        args += [reservation.run_id, reservation.agent or "", reservation.team or ""]
+        for name, value in (details or {}).items():
+            args += [name, value]
         code = await self._settle(
-            keys=[RESERVATIONS_KEY, reservation.key, *(lv.key for lv in reservation.levels)],
-            args=[
-                reservation.id,
-                actual,
-                self._ttl_ms,  # tombstone lifetime
-                *(lv.expire_at for lv in reservation.levels),
+            keys=[
+                RESERVATIONS_KEY,
+                reservation.key,
+                STREAM_KEY,
+                *(lv.key for lv in levels),
+                *flags,
             ],
+            args=args,
         )
         return {1: SettleResult.RELEASED, 0: SettleResult.GONE, 2: SettleResult.DUPLICATE}[
             int(code)

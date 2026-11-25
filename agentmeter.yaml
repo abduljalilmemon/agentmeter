@@ -19,5 +19,8 @@ loop:
   agents: {}                 # per-agent overrides, e.g. status-poller: {repeat_threshold: 20}
 # admin_token: set AGENTMETER_ADMIN_TOKEN to enable POST /admin/runs/{id}/reset
 alerts:
-  thresholds: [0.5, 0.75, 0.9]
-  webhook_url: ${ALERT_WEBHOOK}
+  thresholds: [0.5, 0.75, 0.9]   # of each budget level's limit, measured on spent
+  webhook_url: ${ALERT_WEBHOOK}  # Slack-compatible; unset: the worker only logs alerts
+  retry_idle_seconds: 30         # a failed post is retried after being pending this long
+events:
+  stream_maxlen: 100000          # am:events, XADD MAXLEN ~

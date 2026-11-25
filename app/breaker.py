@@ -25,6 +25,7 @@ import redis.asyncio as redis
 
 from app.budget import run_key
 from app.config import LoopLimits, Settings
+from app.events import STREAM_KEY
 
 _LUA_DIR = Path(__file__).parent / "lua"
 _INT_FIELDS = frozenset({"steps", "opened_ms"})
@@ -79,7 +80,13 @@ class BreakerClient:
     def _expire_at(self) -> int:
         return int(time.time()) + self._settings.run_ttl_seconds
 
-    async def gate(self, run_id: str, agent: str | None, fingerprint: str | None) -> GateResult:
+    async def gate(
+        self,
+        run_id: str,
+        agent: str | None,
+        fingerprint: str | None,
+        team: str | None = None,
+    ) -> GateResult:
         limits = self.limits(agent)
         result = await self._gate(
             keys=[
@@ -87,8 +94,18 @@ class BreakerClient:
                 steps_key(run_id),
                 fingerprints_key(run_id),
                 run_key(run_id),
+                STREAM_KEY,
             ],
-            args=[limits.step_cap, limits.repeat_threshold, fingerprint or "", self._expire_at()],
+            args=[
+                limits.step_cap,
+                limits.repeat_threshold,
+                fingerprint or "",
+                self._expire_at(),
+                self._settings.events.stream_maxlen,
+                run_id,
+                agent or "",
+                team or "",
+            ],
         )
         if int(result[0]) == 1:
             return GateResult(True, None, 0, int(result[1]), int(result[2]), False)
@@ -96,12 +113,24 @@ class BreakerClient:
         return GateResult(False, _s(reason), int(spent), int(steps), int(repeats), bool(int(new)))
 
     async def record_tool_call(
-        self, run_id: str, agent: str | None, fingerprint: str | None
+        self,
+        run_id: str,
+        agent: str | None,
+        fingerprint: str | None,
+        team: str | None = None,
     ) -> tuple[int, bool]:
         """Track the response tool-call streak. Returns (count in a row, breaker opened)."""
         count, opened = await self._toolcall(
-            keys=[tool_calls_key(run_id), breaker_key(run_id)],
-            args=[fingerprint or "", self.limits(agent).consecutive_tool_calls, self._expire_at()],
+            keys=[tool_calls_key(run_id), breaker_key(run_id), STREAM_KEY, run_key(run_id)],
+            args=[
+                fingerprint or "",
+                self.limits(agent).consecutive_tool_calls,
+                self._expire_at(),
+                self._settings.events.stream_maxlen,
+                run_id,
+                agent or "",
+                team or "",
+            ],
         )
         return int(count), bool(int(opened))
 

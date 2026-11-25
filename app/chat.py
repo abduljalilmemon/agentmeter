@@ -44,7 +44,13 @@ class CallContext:
     def cost(self, input_tokens: int, output_tokens: int) -> int:
         return self.prices.cost_micro(self.model, input_tokens, output_tokens)
 
-    def actual_micro(self, usage: dict[str, Any] | None) -> int | None:
+    @property
+    def worst_case_tokens(self) -> tuple[int, int]:
+        return self.estimate.input_tokens, self.estimate.max_output_tokens
+
+    @staticmethod
+    def usage_tokens(usage: dict[str, Any] | None) -> tuple[int, int] | None:
+        """(prompt, completion) from an upstream ``usage`` object, if it is usable."""
         if not usage:
             return None
         prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
@@ -52,7 +58,20 @@ class CallContext:
             return None
         if isinstance(prompt, bool) or isinstance(completion, bool) or prompt < 0 or completion < 0:
             return None
-        return self.cost(prompt, completion)
+        return prompt, completion
+
+    def actual_micro(self, usage: dict[str, Any] | None) -> int | None:
+        tokens = self.usage_tokens(usage)
+        return None if tokens is None else self.cost(*tokens)
+
+    def stream_tokens(self, result: proxy.StreamResult) -> tuple[int, int]:
+        """The (prompt, completion) tokens that stream_cost billed."""
+        tokens = self.usage_tokens(result.usage)
+        if tokens is not None:
+            return tokens
+        if result.client_disconnected:
+            return self.worst_case_tokens
+        return self.estimate.input_tokens, result.streamed_output_tokens
 
     def stream_cost(self, result: proxy.StreamResult) -> tuple[int, str]:
         """What a finished stream cost, and how we know."""
@@ -162,14 +181,22 @@ class _Settlement:
         self._ctx = ctx
         self.done = False
 
-    async def __call__(self, actual: int, how: str, **extra: Any) -> None:
+    async def __call__(self, actual: int, how: str, tokens: tuple[int, int], **extra: Any) -> None:
+        """``tokens`` = the (prompt, completion) tokens ``actual`` was priced from."""
         if self.done:
             return
         self.done = True
+        details = {
+            "model": self._ctx.model,
+            "prompt_tokens": tokens[0],
+            "completion_tokens": tokens[1],
+            "estimate_micro": self._ctx.estimate_micro,
+            "how": how,
+        }
         with anyio.CancelScope(shield=True):
             outcome: SettleResult | None = None
             try:
-                outcome = await self._budget.settle(self._reservation, actual)
+                outcome = await self._budget.settle(self._reservation, actual, details)
             except (redis.RedisError, OSError):
                 # The sweeper releases the reservation once it expires, but this call's
                 # cost is never added to `spent`: log enough to reconcile it by hand.
@@ -239,7 +266,7 @@ async def _track_tool_call(
     with anyio.CancelScope(shield=True):
         try:
             count, opened = await breaker.record_tool_call(
-                identity.run_id, identity.agent, fingerprint
+                identity.run_id, identity.agent, fingerprint, identity.team
             )
         except (redis.RedisError, OSError) as exc:
             log.warning("tool-call loop check failed run_id=%s: %r", identity.run_id, exc)
@@ -262,19 +289,23 @@ async def _settle_forwarded(
     match forwarded.outcome:
         case proxy.Outcome.OK:
             body = _json_body(forwarded.response)
-            actual = ctx.actual_micro(_usage_from(body))
-            if actual is None:
+            tokens = ctx.usage_tokens(_usage_from(body))
+            if tokens is None:
                 log.warning("2xx without usable usage; settling the estimate")
-                await settle(ctx.estimate_micro, "estimate:no_usage", status=status)
+                await settle(
+                    ctx.estimate_micro, "estimate:no_usage", ctx.worst_case_tokens, status=status
+                )
             else:
-                await settle(actual, "usage", status=status)
+                await settle(ctx.cost(*tokens), "usage", tokens, status=status)
             if breaker is not None:
                 await _track_tool_call(breaker, ctx.identity, first_tool_call(body))
         case proxy.Outcome.UPSTREAM_ERROR | proxy.Outcome.UNREACHABLE:
-            await settle(0, forwarded.outcome.value, status=status)
+            await settle(0, forwarded.outcome.value, (0, 0), status=status)
         case proxy.Outcome.TIMEOUT:
             # The upstream had the request and may have billed it: assume the worst case.
-            await settle(ctx.estimate_micro, "estimate:timeout", status=status)
+            await settle(
+                ctx.estimate_micro, "estimate:timeout", ctx.worst_case_tokens, status=status
+            )
 
 
 async def handle_chat(request: Request, identity: Identity, observer: StreamHook) -> Response:
@@ -319,7 +350,7 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
     breaker: BreakerClient = request.app.state.breaker
     fingerprint = None if identity.loop_exempt else request_fingerprint(body.get("messages"))
     try:
-        gate = await breaker.gate(identity.run_id, identity.agent, fingerprint)
+        gate = await breaker.gate(identity.run_id, identity.agent, fingerprint, identity.team)
     except (redis.RedisError, OSError):
         log.exception("breaker check failed run_id=%s", identity.run_id)
         return proxy.openai_error(
@@ -374,7 +405,8 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
 
         async def on_finish(result: proxy.StreamResult) -> None:
             actual, how = ctx.stream_cost(result)
-            await settle(actual, how, done=result.done, error=result.error)
+            tokens = ctx.stream_tokens(result)
+            await settle(actual, how, tokens, done=result.done, error=result.error)
             if not result.cut:  # only a complete response says what the model decided
                 await _track_tool_call(breaker, identity, result.first_tool_call())
             await observer(ctx, result)
@@ -396,5 +428,5 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
         return forwarded.response
     except BaseException:
         # Cancelled or crashed mid-call: we can't know the cost, so assume the worst case.
-        await settle(ctx.estimate_micro, "estimate:aborted")
+        await settle(ctx.estimate_micro, "estimate:aborted", ctx.worst_case_tokens)
         raise

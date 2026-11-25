@@ -396,3 +396,44 @@ def test_alternating_loop_trips(redis_db: redis.Redis, upstream: Counting) -> No
         assert_breaker_429(chat(c, two("C"), run="alt"), "loop", run="alt")
     assert redis_db.hget(breaker_key("alt"), "source") == "request_repeats"
     assert upstream.count == 4
+
+
+# --- breaker_open events (M4) ---------------------------------------------------------
+
+
+def breaker_events(r: redis.Redis) -> list[dict[str, str]]:
+    return [f for _id, f in r.xrange("am:events") if f["type"] == "breaker_open"]
+
+
+def test_breaker_open_event_for_loop_and_step_cap(
+    redis_db: redis.Redis, monkeypatch: pytest.MonkeyPatch, upstream: Counting
+) -> None:
+    loop = {"repeat_threshold": 3, "step_cap": 3, "consecutive_tool_calls": 2}
+    with proxy_client(upstream, loop=loop) as c:
+        # Request-side loop: the same request three times.
+        for _ in range(4):  # the 4th is refused while open: no second event
+            chat(c, two(), run="lp", X_AM_Agent="bot", X_AM_Team="core")
+        # Step cap: 3 different requests, the 4th call opens it.
+        for i in range(5):
+            chat(c, two(i), run="sc")
+        # Response-side loop: the same tool call in 2 responses in a row.
+        monkeypatch.setenv("MOCK_TOOL_CALL", json.dumps(WEATHER))
+        for i in range(3):
+            chat(c, two(f"t{i}"), run="tc")
+
+    by_run = {e["run"]: e for e in breaker_events(redis_db)}
+    assert len(breaker_events(redis_db)) == 3  # one per opening, none while open
+    assert by_run["lp"] == {
+        "type": "breaker_open",
+        "run": "lp",
+        "agent": "bot",
+        "team": "core",
+        "reason": "loop",
+        "source": "request_repeats",
+        "steps": "3",
+        "spent": str(2 * MOCK_CALL_MICRO),
+    }
+    assert (by_run["sc"]["reason"], by_run["sc"]["source"]) == ("step_cap", "step_cap")
+    assert (by_run["sc"]["steps"], by_run["sc"]["spent"]) == ("4", str(3 * MOCK_CALL_MICRO))
+    assert (by_run["tc"]["reason"], by_run["tc"]["source"]) == ("loop", "response_tool_calls")
+    assert by_run["tc"]["spent"] == str(2 * MOCK_CALL_MICRO)

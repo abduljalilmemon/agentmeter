@@ -149,6 +149,9 @@ class AlertsConfig(_Model):
         default_factory=lambda: [5_000, 7_500, 9_000], alias="thresholds"
     )
     webhook_url: str | None = None
+    # A failed webhook post stays pending and is retried once idle this long (XAUTOCLAIM).
+    retry_idle_seconds: float = Field(default=30.0, gt=0)
+    webhook_timeout_seconds: float = Field(default=10.0, gt=0)
 
     @field_validator("thresholds_bps")
     @classmethod
@@ -161,6 +164,11 @@ class AlertsConfig(_Model):
     @classmethod
     def _empty_is_none(cls, v: Any) -> Any:
         return None if v == "" else v
+
+
+class EventsConfig(_Model):
+    # am:events is trimmed with XADD MAXLEN ~ (approximate: Redis trims whole nodes).
+    stream_maxlen: int = Field(default=100_000, ge=1)
 
 
 class Settings(BaseSettings):
@@ -182,6 +190,7 @@ class Settings(BaseSettings):
     budgets: Budgets = Field(default_factory=Budgets)
     loop: LoopConfig = Field(default_factory=LoopConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
+    events: EventsConfig = Field(default_factory=EventsConfig)
     # Bearer token for /admin/*. Unset (or empty) disables the admin endpoints (404).
     admin_token: SecretStr | None = None
     # A run's budget key lives this long after its last reserve.

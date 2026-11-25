@@ -449,7 +449,7 @@ def test_stream_ends_when_reservation_is_lost(redis_db: redis.Redis) -> None:
 def test_failed_settle_logs_error(
     redis_db: redis.Redis, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    async def broken_settle(self, reservation, actual):
+    async def broken_settle(self, reservation, actual, details=None):
         raise redis.ConnectionError("redis went away")
 
     monkeypatch.setattr(BudgetClient, "settle", broken_settle)

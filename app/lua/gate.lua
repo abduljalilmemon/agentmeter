@@ -5,10 +5,13 @@
 -- KEYS[2]  step count   am:steps:{run}  integer
 -- KEYS[3]  fingerprints am:fp:{run}     hash: fingerprint -> times seen
 -- KEYS[4]  run budget   am:b:run:{run}  read only (spent, for the 429 body)
+-- KEYS[5]  event stream am:events       breaker_open is XADDed when it opens
 -- ARGV[1]  step cap
 -- ARGV[2]  repeat threshold
 -- ARGV[3]  request fingerprint, or "" (fewer than 2 messages, or loop-exempt)
 -- ARGV[4]  absolute expiry, unix seconds (the run key's: these keys share its TTL)
+-- ARGV[5]  stream MAXLEN (approximate)
+-- ARGV[6..8]  run id, agent, team (for the event; "" when absent)
 --
 -- Returns
 --   {1, steps, repeats}                      allowed
@@ -17,10 +20,13 @@
 -- The call that opens the breaker is refused too.
 
 local brk_key, steps_key, fp_key, run_key = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
+local stream = KEYS[5]
 local step_cap = tonumber(ARGV[1])
 local threshold = tonumber(ARGV[2])
 local fingerprint = ARGV[3]
 local expire_at = ARGV[4]
+local maxlen = ARGV[5]
+local run_id, agent, team = ARGV[6], ARGV[7], ARGV[8]
 
 local function spent()
   return redis.call('HGET', run_key, 'spent') or '0'
@@ -32,6 +38,9 @@ local function open(reason, source, steps)
   redis.call('HSET', brk_key, 'reason', reason, 'source', source, 'steps', steps,
     'opened_ms', string.format('%.0f', now_ms))
   redis.call('EXPIREAT', brk_key, expire_at)
+  redis.call('XADD', stream, 'MAXLEN', '~', maxlen, '*',
+    'type', 'breaker_open', 'run', run_id, 'agent', agent, 'team', team,
+    'reason', reason, 'source', source, 'steps', steps, 'spent', spent())
 end
 
 local reason = redis.call('HGET', brk_key, 'reason')
