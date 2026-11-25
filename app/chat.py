@@ -135,8 +135,17 @@ class _Settlement:
             try:
                 outcome = await self._budget.settle(self._reservation, actual)
             except (redis.RedisError, OSError):
-                # The sweeper releases the reservation once it expires (safe side).
-                log.exception("settle failed run_id=%s", self._ctx.identity.run_id)
+                # The sweeper releases the reservation once it expires, but this call's
+                # cost is never added to `spent`: log enough to reconcile it by hand.
+                log.error(
+                    "settle failed: cost NOT recorded run_id=%s reservation_id=%s "
+                    "actual_micro=%d how=%s",
+                    self._ctx.identity.run_id,
+                    self._reservation.id,
+                    actual,
+                    how,
+                    exc_info=True,
+                )
         details = " ".join(f"{k}={v}" for k, v in extra.items())
         log.info(
             "settled run_id=%s model=%s estimate_micro=%d actual_micro=%d how=%s reservation=%s %s",
@@ -152,8 +161,11 @@ class _Settlement:
 
 async def _heartbeat(
     budget: BudgetClient, reservation: Reservation, interval: float, run_id: str
-) -> None:
-    """Keep a streaming call's reservation from being swept while the stream is open."""
+) -> bool:
+    """Keep a streaming call's reservation from being swept while the stream is open.
+
+    Returns True once the reservation is gone, which ends the stream.
+    """
     while True:
         await asyncio.sleep(interval)
         try:
@@ -162,10 +174,10 @@ async def _heartbeat(
             log.warning("reservation heartbeat failed run_id=%s: %r", run_id, exc)
             continue
         if not alive:
-            # Swept (e.g. Redis was unreachable for longer than the TTL). Settle will add
-            # the cost only; the reserved amount was already released.
+            # Swept (e.g. Redis was unreachable for longer than the TTL), so its headroom
+            # may already be used by other calls: end the stream. Settle adds the cost.
             log.warning("reservation gone mid-stream run_id=%s", run_id)
-            return
+            return True
 
 
 def _usage_from(response: Response) -> dict[str, Any] | None:

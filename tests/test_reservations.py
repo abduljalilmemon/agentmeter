@@ -392,3 +392,75 @@ def test_lifespan_sweeper_reclaims_crashed_calls(redis_db: redis.Redis) -> None:
             time.sleep(0.02)
     assert fields(redis_db, run_key("crash"))["reserved"] == 0
     assert redis_db.zcard(RESERVATIONS_KEY) == 0
+
+
+class LosesReservation(httpx.AsyncByteStream):
+    """Streams for a while; partway through, the reservation is reclaimed behind its back
+    (what a sweep on another replica does after a long Redis outage on this one)."""
+
+    def __init__(self, r: redis.Redis, run_id: str):
+        self.r, self.run_id, self.reclaimed = r, run_id, False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        start = time.monotonic()
+        while time.monotonic() - start < 3:
+            if not self.reclaimed and time.monotonic() - start > 0.4:
+                (resv_id,) = self.r.zrange(RESERVATIONS_KEY, 0, -1)
+                self.r.zrem(RESERVATIONS_KEY, resv_id)
+                self.r.delete(f"am:r:{resv_id}")
+                self.r.hset(run_key(self.run_id), "reserved", 0)
+                self.reclaimed = True
+            yield CONTENT_EVENT
+            await anyio.sleep(0.05)
+        yield USAGE_EVENT
+        yield b"data: [DONE]\n\n"
+
+
+def test_stream_ends_when_reservation_is_lost(redis_db: redis.Redis) -> None:
+    from app.estimate import count_text_tokens
+
+    stream = LosesReservation(redis_db, "lost")
+    transport = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=stream
+        )
+    )
+    settings = make_settings("http://up/v1", **SHORT_TTL)  # heartbeat every 0.3 s
+    started = time.monotonic()
+    with TestClient(create_app(settings, upstream_transport=transport)) as c:
+        resp = c.post(
+            "/v1/chat/completions",
+            json={**REQUEST, "stream": True},
+            headers={"X-AM-Run-Id": "lost"},
+        )
+    assert time.monotonic() - started < 2.5  # ended early, not after the 3 s upstream
+    assert stream.reclaimed
+    last = json.loads(resp.text.strip().splitlines()[-1][6:])
+    assert last["error"]["type"] == "agentmeter_reservation_lost"
+    assert last["error"]["code"] == "reservation_lost"
+    assert "data: [DONE]" not in resp.text
+    # Settled normally (no usage arrived): estimated input + the relayed output tokens.
+    relayed = resp.text.count('"content":"tick "')
+    out = relayed * count_text_tokens("gpt-4o-mini", "tick ")
+    expected = -(-(8 * 150_000 + out * 600_000) // 1_000_000)
+    assert fields(redis_db, run_key("lost")) == {"limit": 500_000, "spent": expected, "reserved": 0}
+
+
+def test_failed_settle_logs_error(
+    redis_db: redis.Redis, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def broken_settle(self, reservation, actual):
+        raise redis.ConnectionError("redis went away")
+
+    monkeypatch.setattr(BudgetClient, "settle", broken_settle)
+    from mock_upstream.main import app as mock_app
+
+    app = create_app(make_settings(), upstream_transport=httpx.ASGITransport(app=mock_app))
+    with caplog.at_level("INFO", logger="agentmeter"), TestClient(app) as c:
+        resp = c.post("/v1/chat/completions", json=REQUEST, headers={"X-AM-Run-Id": "nosettle"})
+    assert resp.status_code == 200  # the caller still gets its answer
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "cost NOT recorded" in errors[0].getMessage()
+    assert "actual_micro=14" in errors[0].getMessage()
+    assert errors[0].exc_info is not None

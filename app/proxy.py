@@ -157,7 +157,8 @@ class StreamResult:
 StreamFinish = Callable[[StreamResult], Awaitable[None]]
 TokenCounter = Callable[[str], int]
 # Runs alongside the relay for as long as the stream is open; cancelled when it ends.
-Keepalive = Callable[[], Awaitable[None]]
+# Returning True means the stream must stop (its budget reservation is gone).
+Keepalive = Callable[[], Awaitable[bool]]
 
 
 def _delta_texts(event: dict[str, Any]) -> Iterator[str]:
@@ -299,7 +300,8 @@ class UpstreamStreamingResponse(StreamingResponse):
         self._on_finish = on_finish
         self._count_tokens = count_tokens
         self._keepalive = keepalive
-        self._keepalive_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[bool] | None = None
+        self._lost = False  # set by the keepalive: end the stream at the next chunk
         self._finished = False
         self._relay_ended = False  # upstream ran out (normally or with an error)
         self._iterator = self._relay()
@@ -314,6 +316,21 @@ class UpstreamStreamingResponse(StreamingResponse):
                 if out:
                     self._result.bytes_relayed += len(out)
                     yield out
+                if self._lost:
+                    # Checked per upstream chunk: an idle upstream is bounded by its timeout.
+                    self._result.error = "reservation_lost"
+                    dropped = relay.discard()
+                    log.warning(
+                        "ending stream: reservation lost (%d partial bytes dropped)", dropped
+                    )
+                    yield sse_error_event(
+                        "The budget reservation for this call was lost (Redis unreachable for "
+                        "longer than the reservation TTL), so the stream was ended",
+                        "agentmeter_reservation_lost",
+                        "reservation_lost",
+                    )
+                    self._relay_ended = True
+                    return
             rest = relay.flush()
             if self._result.done:
                 if rest:
@@ -346,10 +363,15 @@ class UpstreamStreamingResponse(StreamingResponse):
         # group; either way the relay never reached its end.
         if self._keepalive is not None:
             self._keepalive_task = asyncio.create_task(self._keepalive())
+            self._keepalive_task.add_done_callback(self._keepalive_done)
         try:
             await super().__call__(scope, receive, send)
         finally:
             await self.close()
+
+    def _keepalive_done(self, task: asyncio.Task[bool]) -> None:
+        if not task.cancelled() and task.exception() is None and task.result():
+            self._lost = True
 
     async def close(self) -> None:
         """Idempotent cleanup: stop the keepalive and the relay, close upstream, report once."""

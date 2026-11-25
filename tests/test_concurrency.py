@@ -89,3 +89,43 @@ def test_100_calls_2_replicas_exactly_10_fit(
     assert state["spent"] == FITS * est.micro  # each success billed its usage, once
     assert state["reserved"] == 0
     assert redis_db.zcard(RESERVATIONS_KEY) == 0
+
+
+@pytest.mark.parametrize(("budget_micro", "label"), [(10_000_000, "roomy"), (2_000, "tight")])
+def test_usage_below_estimate_spent_is_exact_sum(
+    redis_db: redis.Redis, live_mock: str, monkeypatch: pytest.MonkeyPatch, budget_micro, label
+) -> None:
+    """Mock usage (8 in, 20 out: 14 µUSD) is far below the estimate (62). Settles then
+    return headroom while other calls are in flight; spent must still be the exact sum."""
+    settings = make_settings(live_mock)
+    monkeypatch.setenv("MOCK_PROMPT_TOKENS", "8")
+    monkeypatch.setenv("MOCK_COMPLETION_TOKENS", "20")
+    monkeypatch.setenv("MOCK_DELAY_MS", "20")
+    actual = PriceTable(settings.pricing).cost_micro(BODY["model"], 8, 20)
+    est = estimate(PriceTable(settings.pricing), BODY["model"], BODY, settings.default_max_tokens)
+    assert actual < est.micro
+    run_id = f"under-{label}"
+    headers = {
+        "X-AM-Run-Id": run_id,
+        "X-AM-Run-Budget": format(Decimal(budget_micro) / 1_000_000, "f"),
+    }
+
+    with serve(create_app(settings)) as a, serve(create_app(settings)) as b:
+        responses = asyncio.run(_fire([a, b], headers))
+        ok = sum(r.status_code == 200 for r in responses)
+        assert ok + sum(r.status_code == 429 for r in responses) == CALLS
+        state: dict[str, int] = {}
+        for _ in range(250):
+            state = {k: int(v) for k, v in redis_db.hgetall(run_key(run_id)).items()}
+            if state.get("reserved") == 0 and state.get("spent") == ok * actual:
+                break
+            time.sleep(0.02)
+
+    assert state["spent"] == ok * actual  # exactly the sum of the mock usage
+    assert state["spent"] <= state["limit"] == budget_micro
+    assert state["reserved"] == 0
+    if label == "roomy":
+        assert ok == CALLS
+    else:
+        # 2_000 fits at least 2_000 // 62 = 32 concurrent worst cases; settles free more.
+        assert 2_000 // est.micro <= ok < CALLS
