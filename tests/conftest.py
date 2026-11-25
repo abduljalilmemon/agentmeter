@@ -3,6 +3,7 @@ import socket
 import threading
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -63,24 +64,34 @@ def make_settings(upstream: str = "http://mock_upstream/v1", **kw: object):
     return Settings(upstream=upstream, **kw)
 
 
-@pytest.fixture(scope="session")
-def live_mock() -> Iterator[str]:
-    """mock_upstream on a real socket, so a cut stream is a real dropped connection."""
+@contextmanager
+def serve(app) -> Iterator[str]:
+    """Run an ASGI app under uvicorn on a free port in a thread (own event loop).
+
+    Yields its base URL. uvicorn runs the app's lifespan, as in production.
+    """
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    server = uvicorn.Server(
-        uvicorn.Config(_mock_app(), host="127.0.0.1", port=port, log_level="critical")
-    )
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="critical"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     deadline = time.monotonic() + 10
     while not server.started:
-        assert time.monotonic() < deadline, "mock_upstream did not start"
+        assert thread.is_alive() and time.monotonic() < deadline, "server did not start"
         time.sleep(0.02)
-    yield f"http://127.0.0.1:{port}/v1"
-    server.should_exit = True
-    thread.join(timeout=5)
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+@pytest.fixture(scope="session")
+def live_mock() -> Iterator[str]:
+    """mock_upstream on a real socket, so a cut stream is a real dropped connection."""
+    with serve(_mock_app()) as url:
+        yield f"{url}/v1"
 
 
 def _mock_app():

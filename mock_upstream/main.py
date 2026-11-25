@@ -7,6 +7,7 @@ Env vars (read per request, so tests can change them):
   MOCK_FORCE_STATUS       if set (e.g. 400), return an OpenAI-style error with that status
   MOCK_STREAM_CUT         if "1", a streamed response drops the connection after the
                           content chunks, before the usage chunk and [DONE]
+  MOCK_DELAY_MS           default 0; wait this long before answering (lets calls overlap)
 
 GET /_mock/last_request returns the headers and JSON body of the last chat request,
 so tests can check what the proxy forwarded.
@@ -14,6 +15,7 @@ so tests can check what the proxy forwarded.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -70,6 +72,10 @@ async def chat_completions(request: Request) -> dict[str, Any] | JSONResponse | 
     body = json.loads(raw)
     _last_request.clear()
     _last_request.update({"headers": dict(request.headers), "body": body, "raw": raw.decode()})
+
+    delay_ms = _env_int("MOCK_DELAY_MS", 0)
+    if delay_ms:
+        await asyncio.sleep(delay_ms / 1000)
 
     forced = os.environ.get("MOCK_FORCE_STATUS")
     if forced:

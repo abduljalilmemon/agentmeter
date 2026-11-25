@@ -35,4 +35,6 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
-      - run: pytest -q
+      - run: pytest -q -m "not concurrency"
+      - name: Concurrency (100 calls, 2 replicas, budget fits 10)
+        run: pytest -v -m concurrency

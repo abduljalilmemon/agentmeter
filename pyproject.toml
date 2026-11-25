@@ -44,3 +44,6 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "concurrency: multi-replica budget tests (M2 acceptance); CI runs them as their own step",
+]
