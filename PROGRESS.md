@@ -1,7 +1,7 @@
 # Progress
 
 ## Current milestone
-M5 is done. Next is M6: the runaway-agent demo (including the LangGraph version deferred from M3), the Locust overhead benchmark and the README polish.
+M6 is done, so every PLAN milestone (M0 to M6) is implemented. Still open: run the overhead benchmark and publish the measured numbers (bench/results.md and the README table are placeholders), and the open questions below.
 
 ## Done
 - M0 (2026-11-24): pyproject, FastAPI app with `GET /healthz` (pings Redis), config loader, example `agentmeter.yaml`, fake OpenAI `mock_upstream`, Dockerfiles, docker-compose (redis, mock_upstream, proxy), CI (ruff + pytest with a Redis service). `docker compose up` gives `/healthz` → `{"status":"ok","redis":true}`.
@@ -75,6 +75,15 @@ M5 is done. Next is M6: the runaway-agent demo (including the LangGraph version 
   - `am_proxy_overhead_seconds` has an `outcome` label (`forwarded` when the upstream was called, including connection failures; `refused` otherwise).
   - Each replica runs one uvicorn process: the image's CMD has no `--workers` and compose sets no `WEB_CONCURRENCY`, so prometheus_client multiprocess mode isn't needed. A test guards both files.
 - **M5 ✅** The three PLAN metrics exist with `agent`/`team`/`reason` labels. `GET /runs/{id}` reports calls, tokens, cost and breaker events. Poison alerts are dead-lettered, and the lockfile is used in CI.
+
+- M6 (2026-11-26): LangGraph demo and overhead benchmark.
+  - `examples/langgraph_demo/agent.py`: a LangGraph `StateGraph` (agent → tools → agent) with a broken `get_weather`. The model calls go through the `openai` SDK (`base_url` = the proxy, `X-AM-*` headers); `LANGSMITH_TRACING=false`. It stops on the proxy's 429 and prints `GET /runs/{id}`.
+  - Compose check, with `MOCK_TOOL_CALL` set and `AGENTMETER_ADMIN_TOKEN=demo-token`: 3 model calls answered, then HTTP 429 `agentmeter_breaker_open` with `reason=loop`, exit code 0. The report showed 3 calls, 90 tokens, 42 µUSD and an open breaker (`source=response_tool_calls`, event `count=3`).
+  - `bench/overhead.py`: direct-to-mock vs through-proxy, `-n`/`-c`/`--warmup` flags, client-side p50/p95/p99, and server-side percentiles from the change in `am_proxy_overhead_seconds{outcome="forwarded"}`. It writes markdown with the environment.
+  - Functional run against compose (200 calls, concurrency 10): 200/200 OK in both phases, 0 errors, 200 server-side observations (warm-up excluded). The numbers were written to a scratch file and are not committed; `bench/results.md` is placeholders only, and a test enforces that.
+  - The runtime image has no `langgraph`, `langchain_core`, `langsmith` or `openai`, checked inside the built image; a test checks the Dockerfile's install lines.
+  - `requirements.lock` regenerated with the README command (now `.[dev,demo]`). It gained langgraph and its tree (listed in the decisions). `httpx` 0.28.1 → 0.29.0 and `openai` 3.59.0 → 3.60.0 moved because newer releases had come out since M5; the suite passed on them (268 tests).
+- **M6 ✅** The demo stops on `reason=loop` through compose. The benchmark runs and writes results.md, with only placeholders committed.
 
 ## Decisions
 - **Money parsing:** YAML and env values are in USD and converted to integer micro-USD via `Decimal(str(v))`. A value that isn't a whole number of micro-USD is rejected, not rounded. Prices are stored as micro-USD per 1M tokens (`input_per_mtok`, `output_per_mtok`). Model fields drop the `_usd` suffix (`budgets.default_run`, `agents[x].daily`) and use the YAML key as an alias, so `_usd` never labels a micro-USD int.
@@ -221,6 +230,15 @@ M5 is done. Next is M6: the runaway-agent demo (including the LangGraph version 
   - CI and the Dockerfile install with `-c requirements.lock`, and the CI pip cache is keyed on it.
   - `tests/test_lockfile.py` fails if a `pyproject.toml` dependency is missing from the lock or its pin no longer satisfies the declared specifier.
   - The lock pins Linux-only packages (e.g. `uvloop`); on Windows, pip skips them through their markers.
+
+- **Demo extra:** `demo = ["langgraph>=0.2", "openai>=1.40"]` (approved; no `langchain-openai`). Only `examples/` and `tests/test_demo.py` use it. CI installs `.[dev,demo]` so the demo test runs there, in-process against the proxy and mock, never a real API. The image installs `.` only.
+  - Packages the lock gained: `distro`, `jsonpatch`, `jsonpointer`, `langchain-core`, `langchain-protocol`, `langgraph`, `langgraph-checkpoint`, `langgraph-prebuilt`, `langgraph-sdk`, `langsmith`, `orjson`, `ormsgpack`, `requests-toolbelt`, `tenacity`, `uuid_utils`, `xxhash`, `zstandard`.
+- **Demo graph:** plain OpenAI-format message dicts in the state (no LangChain message types), so the only LangChain-side package used directly is `langgraph`. The agent node catches the SDK's `APIStatusError` and ends the graph with the error body. LangGraph's `recursion_limit` (200) is the last resort; AgentMeter stops it first.
+- **Benchmark design:** our own async httpx script, not Locust (PLAN said Locust; httpx was already a dependency, and the spec asked for a script with flags, no new dependency).
+  - Each proxied call gets a fresh run id, so no budget, loop or step-cap refusal mixes in.
+  - Warm-up calls run before each phase, and before the "before" `/metrics` scrape, so they're excluded.
+  - Server-side percentiles use Prometheus' `histogram_quantile` rule on the bucket deltas, so they're only as fine as the buckets.
+- **Template guard:** `tests/test_bench.py` fails if any value cell of the committed `bench/results.md` is not `TBD`, so measured numbers can't be committed by accident.
 
 ## Open questions
 - **o-series models:** they reject `max_tokens` and require `max_completion_tokens`. Should we inject `max_completion_tokens` for them, or for everyone (OpenAI's newer name, but less supported by OpenAI-compatible upstreams)?

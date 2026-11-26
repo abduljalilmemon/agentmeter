@@ -2,7 +2,7 @@
 
 A budget circuit breaker for AI agents. AgentMeter is a drop-in, OpenAI-compatible proxy. It gives every agent run its own budget and refuses the call that would overspend it, before that call reaches the model.
 
-> Status: early development. Budgets, loop detection, the circuit breaker, webhook alerts, Prometheus metrics and the run report work today (M5). The demo and the benchmark are planned. See [Status](#status).
+> Status: early development. All milestones (M0 to M6) are implemented: budgets, loop detection, the circuit breaker, webhook alerts, Prometheus metrics, the run report, a LangGraph demo and an overhead benchmark (not yet run: no numbers are published). See [Status](#status).
 
 ## Why
 
@@ -357,7 +357,7 @@ The scripts are in [app/lua/](app/lua/): `gate` and `toolcall` (the breaker, in 
 | M3: Loop detection, step cap, breaker state, admin reset | ✅ done (the LangGraph demo moves to M6) |
 | M4: Redis Stream events, one-shot 50/75/90% alerts, webhook worker | ✅ done |
 | M5: Prometheus metrics, `GET /runs/{id}` report | ✅ done |
-| M6: Runaway-agent demo, benchmark, docs | planned |
+| M6: LangGraph demo, overhead benchmark, docs | ✅ done (benchmark numbers not measured yet) |
 
 Progress notes and design decisions are in [PROGRESS.md](PROGRESS.md). The full plan is in [PLAN.md](PLAN.md).
 
@@ -380,17 +380,50 @@ Progress notes and design decisions are in [PROGRESS.md](PROGRESS.md). The full 
 
 ## Demo
 
-Placeholder. M6 adds `demo/runaway_agent.py`, an agent with a deliberately broken tool, run with and without AgentMeter.
+[examples/langgraph_demo/agent.py](examples/langgraph_demo/agent.py) is a small LangGraph agent with a deliberately broken tool. The model keeps calling `get_weather`, the tool keeps failing, and the agent keeps handing the error back. Pointed at AgentMeter, the agent is stopped with `reason=loop`, and the script prints the run report.
+
+- **Model calls:** the `openai` SDK, with `base_url` set to the proxy and `X-AM-Run-Id`, `X-AM-Agent` and `X-AM-Team` headers. LangGraph runs the agent → tools → agent loop.
+- **Model:** in compose, mock_upstream, which `MOCK_TOOL_CALL` makes answer with a tool call. No provider key is needed and nothing costs money.
+- **Tracing:** off. The demo sets `LANGSMITH_TRACING=false`.
+
+```bash
+MOCK_TOOL_CALL='{"name": "get_weather", "arguments": {"city": "Paris"}}' \
+AGENTMETER_ADMIN_TOKEN=demo-token docker compose up -d --build
+pip install -c requirements.lock -e ".[demo]"        # langgraph + openai; not in the image
+AGENTMETER_ADMIN_TOKEN=demo-token python examples/langgraph_demo/agent.py
+```
+
+Expected: three model calls are answered, each with the same `get_weather` call and the same failing tool result. The fourth is refused with 429 `agentmeter_breaker_open`, `reason=loop`, and the script exits 0 after printing `GET /runs/{id}`. With a different `repeat_threshold` or `consecutive_tool_calls`, the stop moves accordingly. `tests/test_demo.py` runs the same agent in-process against the proxy and the mock.
 
 ## Benchmark
 
-Placeholder. M6 adds a Locust benchmark that measures the proxy's overhead against the mock upstream. Numbers will be published here only once they have been measured.
+[bench/overhead.py](bench/overhead.py) measures what the proxy adds on top of the upstream. It sends N calls at concurrency C straight to mock_upstream, then the same N calls through AgentMeter, each with its own run id so that every call is forwarded. It reports:
+
+- client-side p50/p95/p99 latency for both phases, and their difference;
+- the proxy's own `am_proxy_overhead_seconds{outcome="forwarded"}` over the proxied phase (from `/metrics` before and after; percentiles interpolated from the buckets);
+- the machine and environment it ran on.
+
+```bash
+docker compose up -d --build
+python bench/overhead.py -n 2000 -c 20 --notes "laptop, compose on Docker Desktop"
+# writes bench/results.md (use --out to write elsewhere)
+```
+
+Results: **not measured yet.** [bench/results.md](bench/results.md) is a template, and its values are placeholders until the benchmark has been run.
+
+| Phase | p50 (ms) | p95 (ms) | p99 (ms) |
+|---|---|---|---|
+| Direct to mock | TBD | TBD | TBD |
+| Through AgentMeter | TBD | TBD | TBD |
+| Proxy overhead (server-side, forwarded) | TBD | TBD | TBD |
+
+The numbers depend heavily on where things run. With compose on Docker Desktop, every call crosses the VM's network twice, so compare runs on the same setup only.
 
 ## Development
 
 ```bash
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -c requirements.lock -e ".[dev]"
+pip install -c requirements.lock -e ".[dev,demo]"   # demo: only for examples/ and its test
 docker compose up -d redis mock_upstream
 ruff check . && ruff format --check . && pytest -q
 ```
@@ -399,15 +432,15 @@ Tests run against the mock upstream and never call a real LLM API. Redis tests u
 
 ### Lockfile
 
-`requirements.lock` pins every runtime and dev dependency. It is a pip constraints file: CI and the Dockerfile install with `-c requirements.lock`, so they get exactly these versions while `pyproject.toml` stays the place where dependencies are declared. A test fails when a dependency in `pyproject.toml` is missing from the lock or the pinned version no longer satisfies it.
+`requirements.lock` pins every runtime, dev and demo dependency. It is a pip constraints file: CI and the Dockerfile install with `-c requirements.lock`, so they get exactly these versions while `pyproject.toml` stays the place where dependencies are declared. A test fails when a dependency in `pyproject.toml` is missing from the lock or the pinned version no longer satisfies it.
 
 After changing dependencies in `pyproject.toml`, regenerate it in a clean Python 3.12 Linux environment (the one CI and the image use). From the repository root:
 
 ```bash
 docker run --rm -v "$PWD:/src:ro" -v "$PWD:/out" python:3.12-slim sh -c '
   set -e; cp -r /src /tmp/am && cd /tmp/am && rm -rf .venv *.egg-info build
-  pip install --no-cache-dir -q ".[dev]"
-  { echo "# Constraints for pip: pip install -c requirements.lock -e \".[dev]\""
+  pip install --no-cache-dir -q ".[dev,demo]"
+  { echo "# Constraints for pip: pip install -c requirements.lock -e \".[dev,demo]\""
     echo "# Generated by pip freeze in a clean python:3.12-slim container. Regenerate with the"
     echo "# command in the README (Development > Lockfile) after changing dependencies."
     pip freeze --exclude agentmeter; } > /out/requirements.lock'
