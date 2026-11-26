@@ -33,7 +33,8 @@ jobs:
         with:
           path: .tiktoken-cache
           key: tiktoken-o200k-cl100k-v1
-      - run: pip install -c requirements.lock -e ".[dev]"
+      # The demo extra makes tests/test_demo.py run here (it never calls a real API).
+      - run: pip install -c requirements.lock -e ".[dev,demo]"
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -q -m "not concurrency"

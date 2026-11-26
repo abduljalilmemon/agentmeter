@@ -31,3 +31,15 @@ def test_lock_pins_every_declared_dependency() -> None:
         assert req.specifier.contains(pins[name], prereleases=True), (
             f"{req.name}=={pins[name]} does not satisfy {req.specifier}: regenerate the lock"
         )
+
+
+def test_runtime_image_does_not_install_the_demo_extra() -> None:
+    """The proxy image installs the package without extras: no langgraph at runtime."""
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text("utf-8")
+    installs = [line for line in dockerfile.splitlines() if "pip install" in line]
+    assert installs, "no pip install in the Dockerfile"
+    for line in installs:
+        assert "[demo" not in line and "langgraph" not in line, line
+        assert "[dev" not in line, line
+    assert any(line.rstrip().endswith("-c requirements.lock .") for line in installs), installs
+    assert "examples" not in dockerfile  # the demo code isn't copied into the image

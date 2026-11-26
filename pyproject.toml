@@ -23,6 +23,11 @@ dev = [
     "ruff>=0.5",
     "openai>=1.40",
 ]
+# examples/langgraph_demo only; never installed in the runtime image.
+demo = [
+    "langgraph>=0.2",
+    "openai>=1.40",
+]
 
 [build-system]
 requires = ["setuptools>=69"]
