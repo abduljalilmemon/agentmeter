@@ -2,7 +2,7 @@
 
 A budget circuit breaker for AI agents. AgentMeter is a drop-in, OpenAI-compatible proxy. It gives every agent run its own budget and refuses the call that would overspend it, before that call reaches the model.
 
-> Status: early development. Budgets, loop detection, the circuit breaker and webhook alerts work today (M4). Metrics, the run report and the demo are planned. See [Status](#status).
+> Status: early development. Budgets, loop detection, the circuit breaker, webhook alerts, Prometheus metrics and the run report work today (M5). The demo and the benchmark are planned. See [Status](#status).
 
 ## Why
 
@@ -168,6 +168,62 @@ Example post:
 :warning: AgentMeter: run budget `run:ticket-4711` crossed 75%: spent $0.000056 of $0.00007 (last call: run `ticket-4711`) (event 1795649434478-0)
 ```
 
+## Observability
+
+### Metrics
+
+Every proxy replica serves `GET /metrics`, and the alert worker serves its own on port `worker_metrics_port` (9101). `docker compose up` also starts Prometheus on [localhost:9090](http://localhost:9090), scraping the proxy and the worker ([deploy/prometheus.yml](deploy/prometheus.yml)).
+
+![The three plan metrics in Prometheus after the scripted loop agent ran](docs/prometheus.png)
+
+| Metric | Type | Labels | Definition |
+|---|---|---|---|
+| `am_spend_usd_total` | counter | `agent`, `team` | USD settled (the actual cost of each call), added when the call settles. |
+| `am_breaker_trips_total` | counter | `reason` (`loop`, `step_cap`) | Breaker openings, counted once when a breaker opens, not for each call it then refuses. |
+| `am_proxy_overhead_seconds` | histogram | none | Time spent in the proxy with the upstream excluded (see below). |
+| `am_requests_total` | counter | `status`, `reason`, `level` | `/v1/chat/completions` responses. For a 429, `reason` is `budget`, `loop` or `step_cap`, and `level` is `run`, `agent` or `team` for budget refusals. |
+| `am_settle_failures_total` | counter | none | Settles that failed (Redis unreachable): that call's cost was not recorded. |
+| `am_alerts_delivered_total` | counter | none | Worker: alerts the webhook accepted (2xx). |
+| `am_alerts_dead_total` | counter | none | Worker: alerts dead-lettered after `alerts.max_attempts`. |
+
+**`am_proxy_overhead_seconds`** is the wall time from the start of the route handler until the proxy has a response to return, minus the time spent waiting for the upstream:
+
+- **Plain call:** the upstream time is the whole upstream request, from sending it to its last body byte.
+- **Stream:** the upstream time is the time to the upstream's response headers. Relaying the stream afterwards is not counted.
+- **Refused calls** (400, 429, 503) never reach the upstream, so they count entirely as overhead.
+- **The settle after a stream ends** is not included, because the client already has every byte by then.
+
+Useful queries: `histogram_quantile(0.95, sum by (le) (rate(am_proxy_overhead_seconds_bucket[5m])))` for p95 overhead, `sum by (agent) (rate(am_spend_usd_total[1h])) * 3600` for spend per hour by agent.
+
+Labels are bounded on purpose: `agent` and `team` (empty when the header is absent), never `run_id`, which would create a new series for every run. Per-run numbers come from the report below. The counters are floats at the export edge only: budgets stay integer micro-USD, and `am_spend_usd_total` is the micro-USD total divided by 10^6.
+
+### Run report
+
+```bash
+curl localhost:8080/runs/ticket-4711 -H "Authorization: Bearer $AGENTMETER_ADMIN_TOKEN"
+```
+
+```json
+{"run_id": "ticket-4711", "agent": "support-bot", "team": "platform",
+ "calls": 3, "steps": 3, "tokens": {"prompt": 30, "completion": 60, "total": 90},
+ "cost_usd": 4.2e-05, "cost_micro": 42, "estimate_usd": 0.001904, "estimate_micro": 1904,
+ "limit_usd": 0.5, "limit_micro": 500000, "spent_usd": 4.2e-05, "spent_micro": 42,
+ "reserved_usd": 0.0, "reserved_micro": 0,
+ "breaker": {"state": "open", "reason": "loop", "source": "response_tool_calls", "steps": null, "opened_ms": 1795657058732},
+ "breaker_events": [{"event": "open", "reason": "loop", "source": "response_tool_calls", "steps": 3, "at_ms": 1795657058732}]}
+```
+
+This is real output from the compose smoke test: the scripted broken-tool agent, stopped on call 4.
+
+- **Totals:** kept in Redis by the Lua scripts, not by scanning the event stream. Each settle adds to `am:run:{id}:stats` (`calls`, `prompt_tokens`, `completion_tokens`, `cost_micro`, `estimate_micro`).
+- **Breaker events:** each breaker opening appends an event to `am:run:{id}:breaker`, which keeps the last 20. An admin reset appends a `reset` event.
+- **Expiry:** both keys expire with the run's budget key.
+- **Fields:**
+  - `calls` counts settled calls, including those that settled at 0 after an upstream error. `steps` counts every call that got past the breaker.
+  - The `*_usd` values are floats for display, formatted as in the 429 bodies. The `*_micro` values are exact.
+  - `breaker.steps` is only set when the request side or the step cap opened the breaker. When the response side opened it, its event's `steps` holds the number of identical tool calls instead.
+- **Access:** the same rules as the reset endpoint. 404 when no `admin_token` is configured, 401 for a missing or wrong bearer token, 400 for an invalid id, and 404 for a run Redis knows nothing about.
+
 ## Admin
 
 ```bash
@@ -237,6 +293,7 @@ events:
 | `alerts.webhook_timeout_seconds` | `10` | httpx timeout for one webhook post. |
 | `alerts.max_attempts` | `10` | Deliveries after which a failing alert is dead-lettered to `am:alerts:dead` and acknowledged. |
 | `events.stream_maxlen` | `100000` | Approximate length cap of `am:events` (`XADD MAXLEN ~`). |
+| `worker_metrics_port` | `9101` | Port of the alert worker's `/metrics`. |
 
 `${VAR}` and `${VAR:-default}` placeholders in the YAML are filled from the environment. Every key can also be overridden with an `AGENTMETER_` variable, using `__` for nesting. For example: `AGENTMETER_UPSTREAM`, `AGENTMETER_REDIS_URL`, `AGENTMETER_BUDGETS__DEFAULT_RUN_USD=1.25`.
 
@@ -263,7 +320,7 @@ Upstream LLM API              Worker: threshold alerts → webhook
 (OpenAI / Gemini / LiteLLM)            Prometheus /metrics
 ```
 
-Steps 1 to 7 and the alert worker are implemented; steps 2 and 3 run as one atomic script, before the reserve, and step 7 happens inside the settle and breaker scripts. `/metrics` is planned (M5).
+Everything in the diagram is implemented: steps 2 and 3 run as one atomic script before the reserve, step 7 happens inside the settle and breaker scripts, and `/metrics` is served by every replica and by the worker.
 
 Budget state in Redis (all values integer micro-USD):
 
@@ -280,6 +337,9 @@ Budget state in Redis (all values integer micro-USD):
 | `am:tc:{run_id}` | the response tool-call streak: last fingerprint and count in a row |
 | `am:alert:{level}:{id}:{bp}` | one-shot flag of a threshold that has fired; expires with its budget key |
 | `am:events` | the event stream (consumer group `am:alerts`) |
+| `am:alerts:dead` | alerts that failed `alerts.max_attempts` times |
+| `am:run:{run_id}:stats` | the run report's totals: `calls`, tokens, `cost_micro`, `estimate_micro`, `agent`, `team`; expires with the run |
+| `am:run:{run_id}:breaker` | the run's last 20 breaker events (JSON); expires with the run |
 
 The breaker keys expire together with the run's budget key.
 
@@ -296,7 +356,7 @@ The scripts are in [app/lua/](app/lua/): `gate` and `toolcall` (the breaker, in 
 | M2c: Reservation sweeper, stream heartbeat; 100-request concurrency test across 2 replicas | ✅ done |
 | M3: Loop detection, step cap, breaker state, admin reset | ✅ done (the LangGraph demo moves to M6) |
 | M4: Redis Stream events, one-shot 50/75/90% alerts, webhook worker | ✅ done |
-| M5: Prometheus metrics, `GET /runs/{id}` report | planned |
+| M5: Prometheus metrics, `GET /runs/{id}` report | ✅ done |
 | M6: Runaway-agent demo, benchmark, docs | planned |
 
 Progress notes and design decisions are in [PROGRESS.md](PROGRESS.md). The full plan is in [PLAN.md](PLAN.md).
@@ -315,6 +375,7 @@ Progress notes and design decisions are in [PROGRESS.md](PROGRESS.md). The full 
 - **Breaker state is per run only:** there is no agent-wide or team-wide breaker, and an OPEN breaker never closes on its own (no half-open state) before its keys expire with the run.
 - **Alerts are at least once:** if the worker dies after the webhook accepted a post but before the `XACK`, that alert is posted again. An alert that keeps failing is retried every `retry_idle_seconds` up to `max_attempts` deliveries, then dead-lettered; an entry trimmed from the stream by `MAXLEN` while still pending is dropped.
 - **No alerts for reserved money:** thresholds are measured on `spent` only, so a burst of large in-flight reservations alerts only once those calls settle.
+- **Metrics are per replica:** each replica and the worker keep their own counters, which reset when the process restarts (Prometheus' `rate()` and `increase()` handle resets). Sum across instances in queries.
 - **Only `/v1/chat/completions`** is proxied. Other endpoints, including the Responses API and Anthropic's `/v1/messages`, are not.
 
 ## Demo
@@ -329,9 +390,27 @@ Placeholder. M6 adds a Locust benchmark that measures the proxy's overhead again
 
 ```bash
 python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+pip install -c requirements.lock -e ".[dev]"
 docker compose up -d redis mock_upstream
 ruff check . && ruff format --check . && pytest -q
 ```
 
 Tests run against the mock upstream and never call a real LLM API. Redis tests use database 15 and flush it before each test. Set `AGENTMETER_TEST_REDIS_URL` to use a different one.
+
+### Lockfile
+
+`requirements.lock` pins every runtime and dev dependency. It is a pip constraints file: CI and the Dockerfile install with `-c requirements.lock`, so they get exactly these versions while `pyproject.toml` stays the place where dependencies are declared. A test fails when a dependency in `pyproject.toml` is missing from the lock or the pinned version no longer satisfies it.
+
+After changing dependencies in `pyproject.toml`, regenerate it in a clean Python 3.12 Linux environment (the one CI and the image use). From the repository root:
+
+```bash
+docker run --rm -v "$PWD:/src:ro" -v "$PWD:/out" python:3.12-slim sh -c '
+  set -e; cp -r /src /tmp/am && cd /tmp/am && rm -rf .venv *.egg-info build
+  pip install --no-cache-dir -q ".[dev]"
+  { echo "# Constraints for pip: pip install -c requirements.lock -e \".[dev]\""
+    echo "# Generated by pip freeze in a clean python:3.12-slim container. Regenerate with the"
+    echo "# command in the README (Development > Lockfile) after changing dependencies."
+    pip freeze --exclude agentmeter; } > /out/requirements.lock'
+```
+
+On Git Bash for Windows, prefix the command with `MSYS_NO_PATHCONV=1`.

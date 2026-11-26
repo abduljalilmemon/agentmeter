@@ -1,7 +1,7 @@
 # Progress
 
 ## Current milestone
-M4 is done. Next is M5: Prometheus metrics and the `GET /runs/{id}` report (built from the `call_settled` and `breaker_open` events). The LangGraph demo agent is deferred to M6.
+M5 is done. Next is M6: the runaway-agent demo (including the LangGraph version deferred from M3), the Locust overhead benchmark and the README polish.
 
 ## Done
 - M0 (2026-11-24): pyproject, FastAPI app with `GET /healthz` (pings Redis), config loader, example `agentmeter.yaml`, fake OpenAI `mock_upstream`, Dockerfiles, docker-compose (redis, mock_upstream, proxy), CI (ruff + pytest with a Redis service). `docker compose up` gives `/healthz` → `{"status":"ok","redis":true}`.
@@ -52,6 +52,25 @@ M4 is done. Next is M5: Prometheus metrics and the `GET /runs/{id}` report (buil
   - The webhook text ends with `(event <stream id>)`.
   - The CI step is renamed to "Concurrency (2 replicas)".
 - **M4 ✅** 50/75/90 fire exactly once per level under concurrent load on 2 replicas, in CI. The worker delivers at least once with retry and acks only after success.
+- M5 (2026-11-26): observability.
+  - `app/metrics.py` with one registry per app and per worker. `GET /metrics` on every replica; the worker serves its own on `worker_metrics_port` (9101).
+  - `GET /runs/{id}` (`app/report.py`) reads totals that `settle.lua` keeps in `am:run:{id}:stats`, and breaker events that `gate.lua` and `toolcall.lua` append to `am:run:{id}:breaker`.
+  - Prometheus (`prom/prometheus:v2.55.1`) in compose, scraping the proxy and the worker ([deploy/prometheus.yml](deploy/prometheus.yml)).
+  - `requirements.lock`, used by CI and the Dockerfile.
+  - New runtime dependency, approved: `prometheus_client` 0.26.0 (pure Python, no dependencies of its own).
+  - Deliberate breakages, each restored from a backup copy:
+    - Counting a trip on every refused call failed 1 test.
+    - Dropping the `calls` HINCRBY failed 4.
+    - Dropping the token HINCRBYs failed 1.
+    - Disabling the dead-letter check failed 1 (step 0).
+  - Compose smoke with `MOCK_TOOL_CALL` set: the scripted broken-tool SDK agent (`X-AM-Agent: support-bot`, `X-AM-Team: platform`) was stopped on call 4 with `reason=loop` (`source=response_tool_calls`).
+    - `GET /runs/{id}`: 3 calls, 30+60 tokens, cost 42 µUSD = spent, breaker open, one `open` event. 401 without a token.
+    - Prometheus, after 8 more calls on other runs: `am_spend_usd_total{agent="support-bot",team="platform"}` 0.000154 (11 calls × 14 µUSD), `am_breaker_trips_total{reason="loop"}` 1, overhead count 12, p95 overhead 0.09 s on Docker Desktop for Windows. Both scrape targets were up.
+    - The screenshot is in `docs/prometheus.png`.
+  - Smoke findings:
+    - The first run's p95 overhead was 0.7 s because of one cold call: the first call built the tiktoken encoder, which takes about 4 s inside the container. The lifespan now warms the encoders of the priced models before serving. After that, all 12 overhead observations were under 0.1 s.
+    - A second run first showed 9 loop trips. That was correct: the healthy-traffic runs reused fixed ids, and their tool-call streaks carried over from earlier smoke runs in the compose Redis. The smoke script now uses unique run ids.
+- **M5 ✅** The three PLAN metrics exist with `agent`/`team`/`reason` labels. `GET /runs/{id}` reports calls, tokens, cost and breaker events. Poison alerts are dead-lettered, and the lockfile is used in CI.
 
 ## Decisions
 - **Money parsing:** YAML and env values are in USD and converted to integer micro-USD via `Decimal(str(v))`. A value that isn't a whole number of micro-USD is rejected, not rounded. Prices are stored as micro-USD per 1M tokens (`input_per_mtok`, `output_per_mtok`). Model fields drop the `_usd` suffix (`budgets.default_run`, `agents[x].daily`) and use the YAML key as an alias, so `_usd` never labels a micro-USD int.
@@ -180,6 +199,25 @@ M4 is done. Next is M5: Prometheus metrics and the `GET /runs/{id}` report (buil
 - **Alert text:** money is formatted from integer micro-USD without floats (`$0.000056`, `$20.00`), and thresholds from bp (`75%`, `12.5%`).
 - **Packaging:** `worker` is a package next to `app` (in `pyproject.toml` and the Dockerfile). The compose `worker` service runs `python -m worker.alerts` from the proxy image, with `ALERT_WEBHOOK` passed through.
 
+- **Metrics registries:** one `CollectorRegistry` per `create_app()` and per worker, not the global default, so test apps (and any second app in a process) never share counters. Counters are floats only at the export edge: `micro / 1e6` when incremented. Budget logic never sees them.
+- **Metric labels:** `agent` and `team` ("" when the header is absent), `reason`, `level`, `status`. Never `run_id`; a test parses `/metrics` and checks that the only label names are agent, team, reason, status, level and le.
+- **`am_spend_usd_total`:** incremented when settle returns `RELEASED` or `GONE` (the cost was added to `spent`), not on `DUPLICATE` or a failed settle.
+- **`am_breaker_trips_total`:** incremented from the scripts' return values (`gate.opened_now`, toolcall `opened`), so once per opening across all replicas, never per refused call.
+- **`am_requests_total{status,reason,level}`:** covers every `/v1/chat/completions` response, including identity-header 400s. `reason`/`level` are set only for 429s. `level` is beyond the spec's `{status}`, as asked ("429 by reason/level included").
+- **`am_proxy_overhead_seconds`:** definition in `app/metrics.py` and the README. Buckets run from 0.5 ms to 2.5 s. It is unlabelled, so refused calls (all overhead, no upstream) are mixed with forwarded ones; M6's benchmark can filter by traffic type.
+- **Run report keys:** `am:run:{id}:stats` (HINCRBY in `settle.lua`: calls, prompt_tokens, completion_tokens, cost_micro, estimate_micro; HSET agent, team) and `am:run:{id}:breaker` (RPUSH of JSON from `gate.lua`/`toolcall.lua` via cjson, LTRIM to the last 20).
+  - Both get the run key's expiry: the stats with EXPIREAT on each settle, the list on each opening.
+  - Timestamps are written as strings in Lua (cjson would format large numbers as floats) and turned into ints in Python.
+- **Report contents:** `calls` = settled calls (including 0-cost settles after upstream errors). `steps` = calls past the breaker. `*_usd` floats formatted as in the 429s, with exact `*_micro` ints beside them. `breaker` = current state.
+  - Beyond the spec: `steps`, `estimate_*`, the `*_micro` fields, and a `reset` event appended by the admin reset (so the history explains why an open breaker closed).
+  - A run is unknown (404) when neither stats, budget, breaker nor history exist.
+- **Report access:** same rules as reset (shared `_admin_denied`): 404 without a configured token, 401 for a wrong or missing bearer token, 400 for an invalid id.
+- **Tokenizer warm-up:** the lifespan builds the tiktoken encoder of every priced model before serving (in a thread), so the first call doesn't pay ~0.5–4 s. This goes beyond the spec, and it came from the smoke test.
+- **Lockfile:** `requirements.lock` is a pip constraints file from `pip freeze --exclude agentmeter` in a clean `python:3.12-slim` container (the README has the exact command).
+  - CI and the Dockerfile install with `-c requirements.lock`, and the CI pip cache is keyed on it.
+  - `tests/test_lockfile.py` fails if a `pyproject.toml` dependency is missing from the lock or its pin no longer satisfies the declared specifier.
+  - The lock pins Linux-only packages (e.g. `uvloop`); on Windows, pip skips them through their markers.
+
 ## Open questions
 - **o-series models:** they reject `max_tokens` and require `max_completion_tokens`. Should we inject `max_completion_tokens` for them, or for everyone (OpenAI's newer name, but less supported by OpenAI-compatible upstreams)?
 - **Image tokens:** the image estimate is a flat constant. gpt-4o-mini bills images at roughly 33× the token count, so 1105 can under-count there. We need a per-model image formula before relying on budgets with vision.
@@ -189,6 +227,8 @@ M4 is done. Next is M5: Prometheus metrics and the `GET /runs/{id}` report (buil
 - **Poison alerts:** resolved in the M4 follow-ups (`alerts.max_attempts`, `am:alerts:dead`). Nothing replays the dead-letter stream yet.
 - **Duplicate posts:** delivery is at least once. A worker killed between the webhook's 2xx and the XACK posts that alert again. Slack has no idempotency key; the text now carries the stream id so duplicates are recognizable.
 - **Alerts on reserved money:** thresholds use `spent` only (per spec). A run with large in-flight reservations can be close to its limit without any alert until they settle. Should there be an optional `spent + reserved` early warning?
+- **Response-side breaker steps:** when the response side opens the breaker, `am:brk` has no `steps` and the event's `steps` is the number of identical tool calls (named so since M4). Should it be renamed (`count`) or filled with the run's step count?
+- **Overhead by traffic type:** the histogram has no labels, so 429s (pure overhead) and forwarded calls are mixed. Add a `path` label (`forwarded`/`refused`) before the M6 benchmark?
 - **Admin auth:** a single static bearer token. Is that enough for v1, or do we need per-operator tokens and an audit trail (the reset is only logged at WARNING)?
 - **Period boundaries:** day and month key names still come from each replica's clock (NTP assumed). Moving them to Redis `TIME` would mean computing the key names inside the script, which breaks the declared-`KEYS` contract further. Worth it?
 - **Failed settle loses the cost:** when settle itself fails (Redis blip), the sweeper releases the reservation but the actual cost is never added to `spent`. Should the proxy retry settles from a local queue?
