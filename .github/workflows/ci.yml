@@ -28,11 +28,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements.lock
       - uses: actions/cache@v4
         with:
           path: .tiktoken-cache
           key: tiktoken-o200k-cl100k-v1
-      - run: pip install -e ".[dev]"
+      - run: pip install -c requirements.lock -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -q -m "not concurrency"

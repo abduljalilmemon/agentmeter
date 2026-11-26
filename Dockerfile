@@ -4,10 +4,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     TIKTOKEN_CACHE_DIR=/opt/tiktoken
 WORKDIR /srv
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md requirements.lock ./
 COPY app ./app
 COPY worker ./worker
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir -c requirements.lock .
 
 # Fetch the tokenizer files at build time so containers never download them at runtime.
 # o200k_base: gpt-4o family and the fallback; cl100k_base: gpt-4 / gpt-3.5.
