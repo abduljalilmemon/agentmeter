@@ -71,6 +71,11 @@ def team_key(team: str, now: datetime) -> str:
     return f"am:b:team:{team}:{now:%Y%m}"
 
 
+def run_stats_key(run_id: str) -> str:
+    """The run report's running totals (settle.lua), expiring with the run key."""
+    return f"am:run:{run_id}:stats"
+
+
 def reservation_key(reservation_id: str) -> str:
     return f"{RESERVATION_PREFIX}{reservation_id}"
 
@@ -248,6 +253,7 @@ class BudgetClient:
                 STREAM_KEY,
                 *(lv.key for lv in levels),
                 *flags,
+                run_stats_key(reservation.run_id),
             ],
             args=args,
         )

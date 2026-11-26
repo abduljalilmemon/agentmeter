@@ -293,3 +293,24 @@ async def test_poison_alert_is_dead_lettered_after_max_attempts(
     await asyncio.sleep(IDLE + 0.05)
     await worker.run_once()  # gone for good: no more attempts
     assert len(hook.attempts) == 4
+
+
+async def test_worker_metrics(redis_db: redis.Redis, make_worker) -> None:
+    redis_db.xadd(STREAM_KEY, THRESHOLD)
+    redis_db.xadd(STREAM_KEY, BREAKER)
+    redis_db.xadd(STREAM_KEY, SETTLED)
+    hook = Hook([200, 500])  # THRESHOLD delivered, BREAKER fails every time from here
+    worker = make_worker(hook)
+    worker._settings = make_settings(
+        alerts={"webhook_url": HOOK, "retry_idle_seconds": IDLE, "max_attempts": 1}
+    )
+    await worker.ensure_group()
+    await worker.run_once()
+    await asyncio.sleep(IDLE + 0.05)
+    await worker.run_once()  # BREAKER's 2nd delivery exceeds max_attempts=1
+
+    def value(name: str) -> float:
+        return worker.metrics.registry.get_sample_value(name) or 0.0
+
+    assert value("am_alerts_delivered_total") == 1  # call_settled is acked, not "delivered"
+    assert value("am_alerts_dead_total") == 1

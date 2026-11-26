@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-settings>=2.3",
     "pyyaml>=6.0",
     "tiktoken>=0.7",
+    "prometheus_client>=0.20",
 ]
 
 [project.optional-dependencies]

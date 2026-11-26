@@ -16,6 +16,7 @@ replicas see one count. ``reset`` clears all four keys and never touches budget 
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,14 @@ def fingerprints_key(run_id: str) -> str:
 
 def tool_calls_key(run_id: str) -> str:
     return f"am:tc:{run_id}"
+
+
+def history_key(run_id: str) -> str:
+    """Breaker events for the run report: JSON entries, the last HISTORY_LEN."""
+    return f"am:run:{run_id}:breaker"
+
+
+HISTORY_LEN = 20  # also hard-coded in gate.lua / toolcall.lua (LTRIM -20 -1)
 
 
 def _s(value: Any) -> str:
@@ -95,6 +104,7 @@ class BreakerClient:
                 fingerprints_key(run_id),
                 run_key(run_id),
                 STREAM_KEY,
+                history_key(run_id),
             ],
             args=[
                 limits.step_cap,
@@ -121,7 +131,13 @@ class BreakerClient:
     ) -> tuple[int, bool]:
         """Track the response tool-call streak. Returns (count in a row, breaker opened)."""
         count, opened = await self._toolcall(
-            keys=[tool_calls_key(run_id), breaker_key(run_id), STREAM_KEY, run_key(run_id)],
+            keys=[
+                tool_calls_key(run_id),
+                breaker_key(run_id),
+                STREAM_KEY,
+                run_key(run_id),
+                history_key(run_id),
+            ],
             args=[
                 fingerprint or "",
                 self.limits(agent).consecutive_tool_calls,
@@ -137,11 +153,17 @@ class BreakerClient:
     async def reset(self, run_id: str) -> ResetResult:
         """Close the breaker and forget the step count and fingerprints (not the money)."""
         keys = [breaker_key(run_id), steps_key(run_id), fingerprints_key(run_id)]
+        # The report's breaker history keeps the reset too (beyond the spec: who reads
+        # the history should see why an open breaker is closed again).
+        entry = json.dumps({"event": "reset", "at_ms": int(time.time() * 1000)})
         async with self._redis.pipeline(transaction=True) as pipe:
             pipe.hgetall(breaker_key(run_id))
             pipe.get(steps_key(run_id))
             pipe.delete(*keys, tool_calls_key(run_id))
-            breaker, steps, _ = await pipe.execute()
+            pipe.rpush(history_key(run_id), entry)
+            pipe.ltrim(history_key(run_id), -HISTORY_LEN, -1)
+            pipe.expireat(history_key(run_id), self._expire_at())
+            breaker, steps, *_ = await pipe.execute()
         fields: dict[str, str | int] = {_s(k): _s(v) for k, v in breaker.items()}
         for name in _INT_FIELDS & fields.keys():
             fields[name] = int(fields[name])

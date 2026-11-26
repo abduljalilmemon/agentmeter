@@ -4,6 +4,7 @@
 -- KEYS[2]  breaker  am:brk:{run}
 -- KEYS[3]  stream   am:events       breaker_open is XADDed when it opens
 -- KEYS[4]  run budget am:b:run:{run} read only (spent, for the event)
+-- KEYS[5]  history  am:run:{run}:breaker  list of breaker events (last 20)
 -- ARGV[1]  fingerprint of the response's first tool call, or "" (no tool call)
 -- ARGV[2]  K, consecutive identical tool calls that count as a loop
 -- ARGV[3]  absolute expiry, unix seconds (the run key's)
@@ -42,6 +43,10 @@ if count >= k and redis.call('EXISTS', brk_key) == 0 then
     'type', 'breaker_open', 'run', ARGV[5], 'agent', ARGV[6], 'team', ARGV[7],
     'reason', 'loop', 'source', 'response_tool_calls', 'steps', count,
     'spent', redis.call('HGET', KEYS[4], 'spent') or '0')
+  redis.call('RPUSH', KEYS[5], cjson.encode({event = 'open', reason = 'loop',
+    source = 'response_tool_calls', steps = count, at_ms = string.format('%.0f', now_ms)}))
+  redis.call('LTRIM', KEYS[5], -20, -1)
+  redis.call('EXPIREAT', KEYS[5], expire_at)
   return {count, 1}
 end
 return {count, 0}

@@ -1,0 +1,14 @@
+# Prometheus for docker compose: scrapes every proxy replica and the alert worker.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: agentmeter-proxy
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["proxy:8080"]
+  - job_name: agentmeter-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["worker:9101"]

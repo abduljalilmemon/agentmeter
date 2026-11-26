@@ -27,6 +27,7 @@ from typing import Any
 
 import httpx
 import redis.asyncio as redis
+from prometheus_client import start_http_server
 
 from app.config import Settings, load_settings
 from app.events import (
@@ -37,6 +38,7 @@ from app.events import (
     alert_text,
     decode,
 )
+from app.metrics import WorkerMetrics
 
 log = logging.getLogger("agentmeter.worker")
 
@@ -51,7 +53,9 @@ class AlertWorker:
         settings: Settings,
         http: httpx.AsyncClient,
         consumer: str,
+        metrics: WorkerMetrics | None = None,
     ) -> None:
+        self.metrics = metrics or WorkerMetrics()
         self._redis = client
         self._settings = settings
         self._http = http
@@ -137,6 +141,7 @@ class AlertWorker:
             pipe.xack(STREAM_KEY, ALERTS_GROUP, entry_id)
             await pipe.execute()
         self.dead += 1
+        self.metrics.dead.inc()
 
     def _webhook_state(self) -> str:
         return "set" if self._settings.alerts.webhook_url else "not set: alerts are logged"
@@ -164,6 +169,7 @@ class AlertWorker:
             return
         await self._ack(entry_id)
         self.posted += 1
+        self.metrics.delivered.inc()
         log.info("alert %s delivered%s: %s", entry_id, " on retry" if retry else "", text)
 
 
@@ -181,10 +187,14 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     settings = load_settings()
     client = redis.from_url(settings.redis_url, decode_responses=True)
+    metrics = WorkerMetrics()
+    start_http_server(settings.worker_metrics_port, registry=metrics.registry)
+    log.info("worker metrics on :%d/metrics", settings.worker_metrics_port)
     timeout = settings.alerts.webhook_timeout_seconds
     async with httpx.AsyncClient(timeout=timeout) as http:
         try:
-            await AlertWorker(client, settings, http, consumer_name()).run_forever()
+            worker = AlertWorker(client, settings, http, consumer_name(), metrics)
+            await worker.run_forever()
         finally:
             await client.aclose()
 

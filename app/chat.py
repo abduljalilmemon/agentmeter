@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import partial
@@ -23,6 +24,7 @@ from app.config import MICRO_PER_USD, Settings
 from app.estimate import Estimate, EstimateError, count_text_tokens, estimate
 from app.identity import Identity
 from app.loops import first_tool_call, request_fingerprint, tool_call_fingerprint
+from app.metrics import ProxyMetrics
 from app.pricing import PriceTable, UnknownModel
 
 log = logging.getLogger("agentmeter")
@@ -175,10 +177,17 @@ def breaker_open(identity: Identity, gate: GateResult) -> JSONResponse:
 class _Settlement:
     """Settles one reservation exactly once, even across cancellation."""
 
-    def __init__(self, budget: BudgetClient, reservation: Reservation, ctx: CallContext) -> None:
+    def __init__(
+        self,
+        budget: BudgetClient,
+        reservation: Reservation,
+        ctx: CallContext,
+        metrics: ProxyMetrics | None = None,
+    ) -> None:
         self._budget = budget
         self._reservation = reservation
         self._ctx = ctx
+        self._metrics = metrics
         self.done = False
 
     async def __call__(self, actual: int, how: str, tokens: tuple[int, int], **extra: Any) -> None:
@@ -198,6 +207,8 @@ class _Settlement:
             try:
                 outcome = await self._budget.settle(self._reservation, actual, details)
             except (redis.RedisError, OSError):
+                if self._metrics is not None:
+                    self._metrics.settle_failures.inc()
                 # The sweeper releases the reservation once it expires, but this call's
                 # cost is never added to `spent`: log enough to reconcile it by hand.
                 log.error(
@@ -209,6 +220,9 @@ class _Settlement:
                     how,
                     exc_info=True,
                 )
+        if self._metrics is not None and outcome in (SettleResult.RELEASED, SettleResult.GONE):
+            identity = self._ctx.identity
+            self._metrics.record_spend(identity.agent, identity.team, actual)
         details = " ".join(f"{k}={v}" for k, v in extra.items())
         log.info(
             "settled run_id=%s model=%s estimate_micro=%d actual_micro=%d how=%s reservation=%s %s",
@@ -257,7 +271,10 @@ def _usage_from(body: dict[str, Any] | None) -> dict[str, Any] | None:
 
 
 async def _track_tool_call(
-    breaker: BreakerClient, identity: Identity, call: tuple[str, Any] | None
+    breaker: BreakerClient,
+    identity: Identity,
+    call: tuple[str, Any] | None,
+    metrics: ProxyMetrics | None = None,
 ) -> None:
     """Response-side loop check (PLAN §3.2): K identical tool calls in a row open it."""
     if identity.loop_exempt:
@@ -272,6 +289,8 @@ async def _track_tool_call(
             log.warning("tool-call loop check failed run_id=%s: %r", identity.run_id, exc)
             return
     if opened:
+        if metrics is not None:
+            metrics.record_trip("loop")
         log.warning(
             "breaker opened run_id=%s reason=loop source=response_tool_calls count=%d",
             identity.run_id,
@@ -284,6 +303,7 @@ async def _settle_forwarded(
     ctx: CallContext,
     forwarded: proxy.Forwarded,
     breaker: BreakerClient | None = None,
+    metrics: ProxyMetrics | None = None,
 ) -> None:
     status = forwarded.response.status_code
     match forwarded.outcome:
@@ -298,7 +318,7 @@ async def _settle_forwarded(
             else:
                 await settle(ctx.cost(*tokens), "usage", tokens, status=status)
             if breaker is not None:
-                await _track_tool_call(breaker, ctx.identity, first_tool_call(body))
+                await _track_tool_call(breaker, ctx.identity, first_tool_call(body), metrics)
         case proxy.Outcome.UPSTREAM_ERROR | proxy.Outcome.UNREACHABLE:
             await settle(0, forwarded.outcome.value, (0, 0), status=status)
         case proxy.Outcome.TIMEOUT:
@@ -356,7 +376,11 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
         return proxy.openai_error(
             503, "Budget store unavailable", "agentmeter_budget_unavailable", "budget_unavailable"
         )
+    metrics: ProxyMetrics = request.app.state.metrics
     if not gate.allowed:
+        request.state.am_reason = gate.reason
+        if gate.opened_now and gate.reason:
+            metrics.record_trip(gate.reason)
         log.log(
             logging.WARNING if gate.opened_now else logging.INFO,
             "breaker %s run_id=%s reason=%s steps=%d repeats=%d",
@@ -377,6 +401,7 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
             503, "Budget store unavailable", "agentmeter_budget_unavailable", "budget_unavailable"
         )
     if isinstance(reserved, Rejection):
+        request.state.am_reason, request.state.am_level = "budget", reserved.level.name
         log.info(
             "budget exhausted run_id=%s level=%s spent=%d reserved=%d limit=%d estimate=%d",
             identity.run_id,
@@ -388,11 +413,12 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
         )
         return budget_exhausted(identity, reserved)
 
-    settle = _Settlement(budget, reserved, ctx)
+    settle = _Settlement(budget, reserved, ctx, metrics)
     url = f"{cfg.upstream.rstrip('/')}/chat/completions"
     client: httpx.AsyncClient = request.app.state.http
     try:
         if not streaming:
+            started = time.perf_counter()
             forwarded = await proxy.forward(
                 client,
                 url,
@@ -400,7 +426,8 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
                 request.headers.items(),
                 params=request.query_params,
             )
-            await _settle_forwarded(settle, ctx, forwarded, breaker)
+            request.state.am_upstream_seconds = time.perf_counter() - started
+            await _settle_forwarded(settle, ctx, forwarded, breaker, metrics)
             return forwarded.response
 
         async def on_finish(result: proxy.StreamResult) -> None:
@@ -408,9 +435,10 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
             tokens = ctx.stream_tokens(result)
             await settle(actual, how, tokens, done=result.done, error=result.error)
             if not result.cut:  # only a complete response says what the model decided
-                await _track_tool_call(breaker, identity, result.first_tool_call())
+                await _track_tool_call(breaker, identity, result.first_tool_call(), metrics)
             await observer(ctx, result)
 
+        started = time.perf_counter()
         forwarded = await proxy.forward_stream(
             client,
             url,
@@ -423,8 +451,10 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
                 _heartbeat, budget, reserved, cfg.reservation_heartbeat_seconds, identity.run_id
             ),
         )
+        # Time to the upstream's response headers (the stream relay is not counted).
+        request.state.am_upstream_seconds = time.perf_counter() - started
         if forwarded.outcome is not proxy.Outcome.STREAMING:
-            await _settle_forwarded(settle, ctx, forwarded)
+            await _settle_forwarded(settle, ctx, forwarded, metrics=metrics)
         return forwarded.response
     except BaseException:
         # Cancelled or crashed mid-call: we can't know the cost, so assume the worst case.

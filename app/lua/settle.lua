@@ -5,6 +5,7 @@
 -- KEYS[3]                 event stream       am:events
 -- KEYS[3+i]   i = 1..n    the level hashes the reservation was made on
 -- KEYS[3+n+(i-1)*m+j]     threshold flag for level i, threshold j  (am:alert:...:{bp})
+-- KEYS[#KEYS]             run report stats  am:run:{id}:stats (hash; expires with run)
 --
 -- ARGV[1]  reservation id         ARGV[2]  actual cost, integer micro-USD
 -- ARGV[3]  tombstone TTL, ms      ARGV[4]  stream MAXLEN (approximate)
@@ -13,6 +14,8 @@
 -- ARGV[7+m+2(i-1)]          level i name (run | agent | team)
 -- ARGV[8+m+2(i-1)]          level i absolute expiry, unix seconds
 -- ARGV[7+m+2n ..]           run, agent, team, then call_settled field/value pairs
+--                           (prompt_tokens, completion_tokens and estimate_micro
+--                           are also summed into the run's stats)
 --
 -- Returns
 --   1  reservation found: reserved -= amount and spent += actual at each level
@@ -96,6 +99,21 @@ redis.call('ZREM', index_key, resv_id)
 redis.call('DEL', resv_key)
 redis.call('HSET', resv_key, 'settled', '1')
 redis.call('PEXPIRE', resv_key, tombstone_ms)
+
+-- Run report (GET /runs/{id}): running totals, kept here rather than by scanning the
+-- stream. Level 1 is always the run, so its expiry is the run key's.
+local stats_key = KEYS[#KEYS]
+redis.call('HINCRBY', stats_key, 'calls', 1)
+redis.call('HINCRBY', stats_key, 'cost_micro', actual_s)
+for k = base + 3, #ARGV - 1, 2 do
+  local field = ARGV[k]
+  if field == 'prompt_tokens' or field == 'completion_tokens' or field == 'estimate_micro' then
+    redis.call('HINCRBY', stats_key, field, ARGV[k + 1])
+  end
+end
+if agent ~= '' then redis.call('HSET', stats_key, 'agent', agent) end
+if team ~= '' then redis.call('HSET', stats_key, 'team', team) end
+if n >= 1 then redis.call('EXPIREAT', stats_key, ARGV[8 + m]) end
 
 local event = {'type', 'call_settled', 'run', run_id, 'agent', agent, 'team', team,
   'cost_micro', actual_s, 'reservation', resv_id,

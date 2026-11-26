@@ -194,6 +194,8 @@ class Settings(BaseSettings):
     loop: LoopConfig = Field(default_factory=LoopConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     events: EventsConfig = Field(default_factory=EventsConfig)
+    # The alert worker serves its own /metrics on this port (prometheus_client's server).
+    worker_metrics_port: int = Field(default=9101, ge=1, le=65535)
     # Bearer token for /admin/*. Unset (or empty) disables the admin endpoints (404).
     admin_token: SecretStr | None = None
     # A run's budget key lives this long after its last reserve.
