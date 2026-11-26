@@ -238,6 +238,7 @@ M6 is done, so every PLAN milestone (M0 to M6) is implemented. Still open: run t
   - Each proxied call gets a fresh run id, so no budget, loop or step-cap refusal mixes in.
   - Warm-up calls run before each phase, and before the "before" `/metrics` scrape, so they're excluded.
   - Server-side percentiles use Prometheus' `histogram_quantile` rule on the bucket deltas, so they're only as fine as the buckets.
+- **CI proves the demo tests ran:** `AGENTMETER_REQUIRE_DEMO=1` in CI turns the demo tests' skip (no `langgraph`) into a failure (`tests.conftest.require_demo_extra`, called inside each demo test so it reports as a failure, not a fixture error). CI runs pytest with `-rs` and posts the summary line as a run annotation, so the skip count is visible without opening the log. PLAN.md now records the httpx-script-instead-of-Locust decision.
 - **Template guard:** `tests/test_bench.py` fails if any value cell of the committed `bench/results.md` is not `TBD`, so measured numbers can't be committed by accident.
 
 ## Open questions

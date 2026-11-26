@@ -428,7 +428,7 @@ docker compose up -d redis mock_upstream
 ruff check . && ruff format --check . && pytest -q
 ```
 
-Tests run against the mock upstream and never call a real LLM API. Redis tests use database 15 and flush it before each test. Set `AGENTMETER_TEST_REDIS_URL` to use a different one.
+Tests run against the mock upstream and never call a real LLM API. Redis tests use database 15 and flush it before each test. Set `AGENTMETER_TEST_REDIS_URL` to use a different one. The demo tests skip when the `demo` extra isn't installed; CI sets `AGENTMETER_REQUIRE_DEMO=1` (and `AGENTMETER_REQUIRE_REDIS=1`) so a missing extra or Redis fails the run instead of skipping.
 
 ### Lockfile
 

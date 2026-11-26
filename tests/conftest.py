@@ -1,3 +1,4 @@
+import importlib
 import os
 import socket
 import threading
@@ -14,7 +15,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_CONFIG = REPO_ROOT / "agentmeter.yaml"
 
 # Test-harness knobs; not settings fields, so they survive the env scrub below.
-_TEST_KNOBS = {"AGENTMETER_TEST_REDIS_URL", "AGENTMETER_REQUIRE_REDIS"}
+_TEST_KNOBS = {
+    "AGENTMETER_TEST_REDIS_URL",
+    "AGENTMETER_REQUIRE_REDIS",
+    "AGENTMETER_REQUIRE_DEMO",
+}
 
 # Tests own this Redis database and FLUSHDB it before each test that uses it.
 TEST_REDIS_URL = os.environ.get("AGENTMETER_TEST_REDIS_URL", "redis://localhost:6379/15")
@@ -33,6 +38,20 @@ def _clean_agentmeter_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in list(os.environ):
         if (name.startswith("AGENTMETER_") and name not in _TEST_KNOBS) or name == "ALERT_WEBHOOK":
             monkeypatch.delenv(name)
+
+
+def require_demo_extra(importer=importlib.import_module) -> None:
+    """Skip a test when the ``demo`` extra (langgraph) isn't installed, or fail it when
+    AGENTMETER_REQUIRE_DEMO=1 (CI), so the demo tests can't silently stop running."""
+    try:
+        importer("langgraph")
+    except ImportError:
+        if os.environ.get("AGENTMETER_REQUIRE_DEMO") == "1":
+            pytest.fail(
+                "AGENTMETER_REQUIRE_DEMO=1 but the demo extra is not installed "
+                '(pip install -c requirements.lock -e ".[dev,demo]")'
+            )
+        pytest.skip("demo extra not installed")
 
 
 def redis_reachable(url: str = TEST_REDIS_URL) -> bool:

@@ -21,6 +21,7 @@ jobs:
     env:
       AGENTMETER_TEST_REDIS_URL: redis://localhost:6379/15
       AGENTMETER_REQUIRE_REDIS: "1"
+      AGENTMETER_REQUIRE_DEMO: "1"  # tests/test_demo.py fails instead of skipping
       TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.tiktoken-cache
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +38,12 @@ jobs:
       - run: pip install -c requirements.lock -e ".[dev,demo]"
       - run: ruff check .
       - run: ruff format --check .
-      - run: pytest -q -m "not concurrency"
+      - name: Tests
+        run: |
+          pytest -q -rs -m "not concurrency" | tee pytest.out
+          # Surface the summary line (passed / skipped counts) as a run annotation.
+          echo "::notice title=pytest summary::$(tail -n 1 pytest.out)"
       - name: Concurrency (2 replicas)
-        run: pytest -v -m concurrency
+        run: |
+          pytest -v -rs -m concurrency | tee pytest-concurrency.out
+          echo "::notice title=pytest concurrency summary::$(tail -n 1 pytest-concurrency.out)"

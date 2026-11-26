@@ -158,6 +158,7 @@ Each milestone should end with green tests and a commit.
 **M6: Demo, benchmark, README (1–2 days)**
 - `demo/runaway_agent.py`: run once without AgentMeter (capped by a mock so it doesn't cost real money) and once with it. Report calls, cost and time-to-stop for both.
 - Locust benchmark: measure p50 and p95 proxy overhead against the mock upstream
+  - **Decision (M6):** the benchmark is a plain async httpx script, `bench/overhead.py`, instead of Locust, to avoid a new dependency (httpx is already one). It reports p50/p95/p99 client-side, direct-to-mock vs through the proxy, plus the proxy's own `am_proxy_overhead_seconds{outcome="forwarded"}`. The demo is `examples/langgraph_demo/agent.py` (LangGraph, approved as a `demo` extra).
 - README with the problem, a GIF of the demo, a one-line quickstart, an architecture diagram and the benchmark table
 - ✅ Someone who has never seen the repo can run the demo in under 5 minutes
 **Stretch**
