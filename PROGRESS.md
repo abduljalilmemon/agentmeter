@@ -70,6 +70,10 @@ M5 is done. Next is M6: the runaway-agent demo (including the LangGraph version 
   - Smoke findings:
     - The first run's p95 overhead was 0.7 s because of one cold call: the first call built the tiktoken encoder, which takes about 4 s inside the container. The lifespan now warms the encoders of the priced models before serving. After that, all 12 overhead observations were under 0.1 s.
     - A second run first showed 9 loop trips. That was correct: the healthy-traffic runs reused fixed ids, and their tool-call streaks carried over from earlier smoke runs in the compose Redis. The smoke script now uses unique run ids.
+- M5 follow-ups (2026-11-26):
+  - Response-side breaker events (`breaker_open` in the stream and the run's history) now carry `count`, the number of identical tool calls, instead of a misnamed `steps`. The report's `breaker.steps` stays null for those trips (documented). The alert text says "after N identical tool calls in a row".
+  - `am_proxy_overhead_seconds` has an `outcome` label (`forwarded` when the upstream was called, including connection failures; `refused` otherwise).
+  - Each replica runs one uvicorn process: the image's CMD has no `--workers` and compose sets no `WEB_CONCURRENCY`, so prometheus_client multiprocess mode isn't needed. A test guards both files.
 - **M5 ✅** The three PLAN metrics exist with `agent`/`team`/`reason` labels. `GET /runs/{id}` reports calls, tokens, cost and breaker events. Poison alerts are dead-lettered, and the lockfile is used in CI.
 
 ## Decisions
@@ -204,7 +208,7 @@ M5 is done. Next is M6: the runaway-agent demo (including the LangGraph version 
 - **`am_spend_usd_total`:** incremented when settle returns `RELEASED` or `GONE` (the cost was added to `spent`), not on `DUPLICATE` or a failed settle.
 - **`am_breaker_trips_total`:** incremented from the scripts' return values (`gate.opened_now`, toolcall `opened`), so once per opening across all replicas, never per refused call.
 - **`am_requests_total{status,reason,level}`:** covers every `/v1/chat/completions` response, including identity-header 400s. `reason`/`level` are set only for 429s. `level` is beyond the spec's `{status}`, as asked ("429 by reason/level included").
-- **`am_proxy_overhead_seconds`:** definition in `app/metrics.py` and the README. Buckets run from 0.5 ms to 2.5 s. It is unlabelled, so refused calls (all overhead, no upstream) are mixed with forwarded ones; M6's benchmark can filter by traffic type.
+- **`am_proxy_overhead_seconds{outcome}`:** definition in `app/metrics.py` and the README. Buckets run from 0.5 ms to 2.5 s. `outcome=forwarded` when the proxy called the upstream, `refused` when it didn't.
 - **Run report keys:** `am:run:{id}:stats` (HINCRBY in `settle.lua`: calls, prompt_tokens, completion_tokens, cost_micro, estimate_micro; HSET agent, team) and `am:run:{id}:breaker` (RPUSH of JSON from `gate.lua`/`toolcall.lua` via cjson, LTRIM to the last 20).
   - Both get the run key's expiry: the stats with EXPIREAT on each settle, the list on each opening.
   - Timestamps are written as strings in Lua (cjson would format large numbers as floats) and turned into ints in Python.
@@ -227,8 +231,6 @@ M5 is done. Next is M6: the runaway-agent demo (including the LangGraph version 
 - **Poison alerts:** resolved in the M4 follow-ups (`alerts.max_attempts`, `am:alerts:dead`). Nothing replays the dead-letter stream yet.
 - **Duplicate posts:** delivery is at least once. A worker killed between the webhook's 2xx and the XACK posts that alert again. Slack has no idempotency key; the text now carries the stream id so duplicates are recognizable.
 - **Alerts on reserved money:** thresholds use `spent` only (per spec). A run with large in-flight reservations can be close to its limit without any alert until they settle. Should there be an optional `spent + reserved` early warning?
-- **Response-side breaker steps:** when the response side opens the breaker, `am:brk` has no `steps` and the event's `steps` is the number of identical tool calls (named so since M4). Should it be renamed (`count`) or filled with the run's step count?
-- **Overhead by traffic type:** the histogram has no labels, so 429s (pure overhead) and forwarded calls are mixed. Add a `path` label (`forwarded`/`refused`) before the M6 benchmark?
 - **Admin auth:** a single static bearer token. Is that enough for v1, or do we need per-operator tokens and an audit trail (the reset is only logged at WARNING)?
 - **Period boundaries:** day and month key names still come from each replica's clock (NTP assumed). Moving them to Redis `TIME` would mean computing the key names inside the script, which breaks the declared-`KEYS` contract further. Worth it?
 - **Failed settle loses the cost:** when settle itself fails (Redis blip), the sweeper releases the reservation but the actual cost is never added to `spent`. Should the proxy retry settles from a local queue?

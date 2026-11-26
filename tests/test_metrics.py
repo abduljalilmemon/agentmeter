@@ -114,8 +114,9 @@ def test_overhead_excludes_the_upstream(redis_db: redis.Redis, stream: bool) -> 
     with TestClient(app) as c:
         for i in range(3):
             assert post(c, f"oh-{stream}", two(i), stream=stream).status_code == 200
-        count = sample(c, "am_proxy_overhead_seconds_count")
-        total = sample(c, "am_proxy_overhead_seconds_sum")
+        count = sample(c, "am_proxy_overhead_seconds_count", outcome="forwarded")
+        total = sample(c, "am_proxy_overhead_seconds_sum", outcome="forwarded")
+        assert sample(c, "am_proxy_overhead_seconds_count", outcome="refused") == 0
     assert count == 3
     # Each call spends 0.4 s upstream (in the response for plain calls, in the stream body
     # for streams); none of it may show up as proxy overhead.
@@ -159,4 +160,41 @@ def test_metrics_endpoint_has_no_run_id_label(redis_db: redis.Redis) -> None:
         if line.startswith("am_") and "{" in line
         for part in line[line.index("{") + 1 : line.index("}")].split(",")
     }
-    assert labels <= {"agent", "team", "reason", "status", "level", "le"}, labels
+    assert labels <= {"agent", "team", "reason", "status", "level", "outcome", "le"}, labels
+
+
+def test_overhead_outcome_label(redis_db: redis.Redis) -> None:
+    with client(loop={"repeat_threshold": 2}) as c:
+        assert post(c, "o1", two("a")).status_code == 200  # forwarded
+        assert post(c, "o1", two("b"), stream=True).status_code == 200  # forwarded
+        assert post(c, "o1", two("a")).status_code == 429  # refused: loop
+        assert post(c, "o2", X_AM_Run_Budget="0").status_code == 429  # refused: budget
+        assert post(c, "o3", X_AM_Run_Id="bad*id").status_code == 400  # refused: header
+        forwarded = sample(c, "am_proxy_overhead_seconds_count", outcome="forwarded")
+        refused = sample(c, "am_proxy_overhead_seconds_count", outcome="refused")
+    assert (forwarded, refused) == (2, 3)
+
+
+def test_upstream_failure_still_counts_as_forwarded(redis_db: redis.Redis) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    app = create_app(make_settings("http://up/v1"), upstream_transport=httpx.MockTransport(refuse))
+    with TestClient(app) as c:
+        assert post(c, "uf").status_code == 502
+        assert sample(c, "am_proxy_overhead_seconds_count", outcome="forwarded") == 1
+
+
+def test_each_replica_runs_one_uvicorn_process() -> None:
+    """Metrics live in process memory (no prometheus_client multiprocess mode), so the
+    image must not start several uvicorn workers; scale with replicas instead."""
+    from tests.conftest import REPO_ROOT
+
+    cmd = next(
+        line
+        for line in (REPO_ROOT / "Dockerfile").read_text().splitlines()
+        if line.startswith("CMD")
+    )
+    assert "uvicorn" in cmd and "--workers" not in cmd, cmd
+    compose = (REPO_ROOT / "docker-compose.yml").read_text()
+    assert "--workers" not in compose and "WEB_CONCURRENCY" not in compose

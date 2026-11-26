@@ -419,6 +419,7 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
     try:
         if not streaming:
             started = time.perf_counter()
+            request.state.am_forwarded = True
             forwarded = await proxy.forward(
                 client,
                 url,
@@ -439,6 +440,7 @@ async def handle_chat(request: Request, identity: Identity, observer: StreamHook
             await observer(ctx, result)
 
         started = time.perf_counter()
+        request.state.am_forwarded = True
         forwarded = await proxy.forward_stream(
             client,
             url,

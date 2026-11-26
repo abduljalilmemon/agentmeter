@@ -58,7 +58,7 @@ async def run_report(client: redis.Redis, run_id: str) -> dict[str, Any] | None:
         except ValueError:
             continue
     for event in events:
-        for name in ("steps", "at_ms"):
+        for name in ("steps", "count", "at_ms"):
             if name in event:
                 event[name] = int(event[name])
 

@@ -41,10 +41,10 @@ if count >= k and redis.call('EXISTS', brk_key) == 0 then
   redis.call('EXPIREAT', brk_key, expire_at)
   redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[4], '*',
     'type', 'breaker_open', 'run', ARGV[5], 'agent', ARGV[6], 'team', ARGV[7],
-    'reason', 'loop', 'source', 'response_tool_calls', 'steps', count,
+    'reason', 'loop', 'source', 'response_tool_calls', 'count', count,
     'spent', redis.call('HGET', KEYS[4], 'spent') or '0')
   redis.call('RPUSH', KEYS[5], cjson.encode({event = 'open', reason = 'loop',
-    source = 'response_tool_calls', steps = count, at_ms = string.format('%.0f', now_ms)}))
+    source = 'response_tool_calls', count = count, at_ms = string.format('%.0f', now_ms)}))
   redis.call('LTRIM', KEYS[5], -20, -1)
   redis.call('EXPIREAT', KEYS[5], expire_at)
   return {count, 1}

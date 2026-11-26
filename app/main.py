@@ -136,6 +136,7 @@ def create_app(
     async def chat_completions(request: Request) -> Response:
         started = time.perf_counter()
         request.state.am_upstream_seconds = 0.0  # set by handle_chat around the upstream
+        request.state.am_forwarded = False  # set by handle_chat when it calls the upstream
         request.state.am_reason = request.state.am_level = ""
         try:
             identity = parse_identity(request.headers)
@@ -148,7 +149,8 @@ def create_app(
             response.headers[RUN_ID_HEADER] = identity.run_id
         state = request.state
         overhead = time.perf_counter() - started - state.am_upstream_seconds
-        metrics.overhead.observe(max(overhead, 0.0))
+        outcome = "forwarded" if state.am_forwarded else "refused"
+        metrics.overhead.labels(outcome).observe(max(overhead, 0.0))
         metrics.requests.labels(str(response.status_code), state.am_reason, state.am_level).inc()
         return response
 

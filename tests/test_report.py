@@ -112,6 +112,9 @@ def test_breaker_events_show_up(redis_db: redis.Redis, monkeypatch) -> None:
             call(c, "brk", i)
         report = c.get("/runs/brk", headers=AUTH).json()
     assert report["breaker"]["source"] == "response_tool_calls"
+    assert report["breaker"]["steps"] is None  # documented: no step count for this source
+    last = report["breaker_events"][-1]
+    assert last["count"] == 2 and "steps" not in last
     assert [(e["event"], e.get("source")) for e in report["breaker_events"]] == [
         ("open", "request_repeats"),
         ("reset", None),

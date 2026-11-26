@@ -301,3 +301,20 @@ def test_alert_text() -> None:
     assert "circuit breaker OPEN for run `r9`" in breaker
     assert "reason loop (request_repeats) after 4 steps, spent $0.000042" in breaker
     assert "POST /admin/runs/r9/reset" in breaker
+
+
+def test_breaker_alert_text_for_response_side_trip() -> None:
+    text = alert_text(
+        {
+            "type": "breaker_open",
+            "run": "r2",
+            "reason": "loop",
+            "source": "response_tool_calls",
+            "count": "3",
+            "spent": "42",
+            "agent": "",
+            "team": "",
+        }
+    )
+    assert "after 3 identical tool calls in a row" in text
+    assert "steps" not in text

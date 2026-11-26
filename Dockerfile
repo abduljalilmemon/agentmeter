@@ -18,4 +18,6 @@ COPY agentmeter.yaml ./
 ENV AGENTMETER_CONFIG=/srv/agentmeter.yaml
 
 EXPOSE 8080
+# One uvicorn process per container: metrics live in process memory (no prometheus_client
+# multiprocess mode), so scale with more replicas, not with --workers.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]

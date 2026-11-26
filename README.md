@@ -147,7 +147,7 @@ Every state change worth knowing about is written to one Redis Stream, `am:event
 |---|---|---|
 | `call_settled` | `settle.lua`, once per call | `run`, `agent`, `team`, `model`, `prompt_tokens`, `completion_tokens`, `cost_micro`, `estimate_micro`, `how` (`usage`, `tiktoken`, `estimate:*`, ...), `reservation`, `reservation_state` (`released` or `gone`) |
 | `threshold_crossed` | `settle.lua` | `level` (`run`, `agent`, `team`), `key`, `threshold_bp`, `spent`, `limit`, and the `run`, `agent`, `team` of the call that crossed it |
-| `breaker_open` | `gate.lua`, `toolcall.lua` | `run`, `agent`, `team`, `reason`, `source`, `steps`, `spent` |
+| `breaker_open` | `gate.lua`, `toolcall.lua` | `run`, `agent`, `team`, `reason`, `source`, `spent`, and `steps` (request repeats or step cap: the run's step count) or `count` (response side: identical tool calls in a row) |
 
 All values are strings: money in integer micro-USD, thresholds in integer basis points. The stream is capped with `XADD MAXLEN ~ events.stream_maxlen`.
 
@@ -180,7 +180,7 @@ Every proxy replica serves `GET /metrics`, and the alert worker serves its own o
 |---|---|---|---|
 | `am_spend_usd_total` | counter | `agent`, `team` | USD settled (the actual cost of each call), added when the call settles. |
 | `am_breaker_trips_total` | counter | `reason` (`loop`, `step_cap`) | Breaker openings, counted once when a breaker opens, not for each call it then refuses. |
-| `am_proxy_overhead_seconds` | histogram | none | Time spent in the proxy with the upstream excluded (see below). |
+| `am_proxy_overhead_seconds` | histogram | `outcome` (`forwarded`, `refused`) | Time spent in the proxy with the upstream excluded (see below). |
 | `am_requests_total` | counter | `status`, `reason`, `level` | `/v1/chat/completions` responses. For a 429, `reason` is `budget`, `loop` or `step_cap`, and `level` is `run`, `agent` or `team` for budget refusals. |
 | `am_settle_failures_total` | counter | none | Settles that failed (Redis unreachable): that call's cost was not recorded. |
 | `am_alerts_delivered_total` | counter | none | Worker: alerts the webhook accepted (2xx). |
@@ -190,7 +190,7 @@ Every proxy replica serves `GET /metrics`, and the alert worker serves its own o
 
 - **Plain call:** the upstream time is the whole upstream request, from sending it to its last body byte.
 - **Stream:** the upstream time is the time to the upstream's response headers. Relaying the stream afterwards is not counted.
-- **Refused calls** (400, 429, 503) never reach the upstream, so they count entirely as overhead.
+- **`outcome`:** `forwarded` when the proxy sent the call upstream, whatever the upstream then answered (including a connection failure). `refused` when it answered without contacting the upstream (400, 429, 503); those calls count entirely as overhead. The benchmark reads `outcome="forwarded"`.
 - **The settle after a stream ends** is not included, because the client already has every byte by then.
 
 Useful queries: `histogram_quantile(0.95, sum by (le) (rate(am_proxy_overhead_seconds_bucket[5m])))` for p95 overhead, `sum by (agent) (rate(am_spend_usd_total[1h])) * 3600` for spend per hour by agent.
@@ -210,7 +210,7 @@ curl localhost:8080/runs/ticket-4711 -H "Authorization: Bearer $AGENTMETER_ADMIN
  "limit_usd": 0.5, "limit_micro": 500000, "spent_usd": 4.2e-05, "spent_micro": 42,
  "reserved_usd": 0.0, "reserved_micro": 0,
  "breaker": {"state": "open", "reason": "loop", "source": "response_tool_calls", "steps": null, "opened_ms": 1795657058732},
- "breaker_events": [{"event": "open", "reason": "loop", "source": "response_tool_calls", "steps": 3, "at_ms": 1795657058732}]}
+ "breaker_events": [{"event": "open", "reason": "loop", "source": "response_tool_calls", "count": 3, "at_ms": 1795657058732}]}
 ```
 
 This is real output from the compose smoke test: the scripted broken-tool agent, stopped on call 4.
@@ -221,7 +221,7 @@ This is real output from the compose smoke test: the scripted broken-tool agent,
 - **Fields:**
   - `calls` counts settled calls, including those that settled at 0 after an upstream error. `steps` counts every call that got past the breaker.
   - The `*_usd` values are floats for display, formatted as in the 429 bodies. The `*_micro` values are exact.
-  - `breaker.steps` is only set when the request side or the step cap opened the breaker. When the response side opened it, its event's `steps` holds the number of identical tool calls instead.
+  - `breaker.steps` is only set when the request side or the step cap opened the breaker. It stays `null` when the response side opened it; that event carries `count` (identical tool calls in a row) instead of `steps`.
 - **Access:** the same rules as the reset endpoint. 404 when no `admin_token` is configured, 401 for a missing or wrong bearer token, 400 for an invalid id, and 404 for a run Redis knows nothing about.
 
 ## Admin
@@ -375,7 +375,7 @@ Progress notes and design decisions are in [PROGRESS.md](PROGRESS.md). The full 
 - **Breaker state is per run only:** there is no agent-wide or team-wide breaker, and an OPEN breaker never closes on its own (no half-open state) before its keys expire with the run.
 - **Alerts are at least once:** if the worker dies after the webhook accepted a post but before the `XACK`, that alert is posted again. An alert that keeps failing is retried every `retry_idle_seconds` up to `max_attempts` deliveries, then dead-lettered; an entry trimmed from the stream by `MAXLEN` while still pending is dropped.
 - **No alerts for reserved money:** thresholds are measured on `spent` only, so a burst of large in-flight reservations alerts only once those calls settle.
-- **Metrics are per replica:** each replica and the worker keep their own counters, which reset when the process restarts (Prometheus' `rate()` and `increase()` handle resets). Sum across instances in queries.
+- **Metrics are per replica:** each replica runs a single uvicorn process (no `--workers`), so there is no prometheus_client multiprocess mode; scale with more replicas. Each replica and the worker keep their own counters, which reset when the process restarts (Prometheus' `rate()` and `increase()` handle resets). Sum across instances in queries.
 - **Only `/v1/chat/completions`** is proxied. Other endpoints, including the Responses API and Anthropic's `/v1/messages`, are not.
 
 ## Demo

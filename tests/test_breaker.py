@@ -437,3 +437,6 @@ def test_breaker_open_event_for_loop_and_step_cap(
     assert (by_run["sc"]["steps"], by_run["sc"]["spent"]) == ("4", str(3 * MOCK_CALL_MICRO))
     assert (by_run["tc"]["reason"], by_run["tc"]["source"]) == ("loop", "response_tool_calls")
     assert by_run["tc"]["spent"] == str(2 * MOCK_CALL_MICRO)
+    # Response side: the number of identical tool calls is "count", not "steps".
+    assert by_run["tc"]["count"] == "2" and "steps" not in by_run["tc"]
+    assert "count" not in by_run["lp"] and "count" not in by_run["sc"]

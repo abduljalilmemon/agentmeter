@@ -12,7 +12,9 @@ exists exactly when the state change it describes happened:
                                     fields: level, key, threshold_bp, spent, limit, run,
                                     agent, team
     breaker_open       gate.lua,    a run's breaker opened
-                       toolcall.lua fields: run, agent, team, reason, source, steps, spent
+                       toolcall.lua fields: run, agent, team, reason, source, spent, and
+                                    steps (gate: request repeats, step cap) or count
+                                    (toolcall: identical tool calls in a row)
 
 Every field is a string; money is integer micro-USD, thresholds integer basis points.
 Each XADD uses ``MAXLEN ~ events.stream_maxlen``.
@@ -78,6 +80,12 @@ def _int(fields: Mapping[str, str], name: str) -> int:
         return 0
 
 
+def _after(fields: Mapping[str, str]) -> str:
+    if "count" in fields:  # response side: identical tool calls in a row
+        return f"{_int(fields, 'count')} identical tool calls in a row"
+    return f"{_int(fields, 'steps')} steps"
+
+
 def _who(fields: Mapping[str, str]) -> str:
     parts = [f"run `{fields.get('run', '?')}`"]
     if fields.get("agent"):
@@ -112,7 +120,7 @@ def _alert_text(fields: Mapping[str, str]) -> str:
         return (
             f":no_entry: AgentMeter: circuit breaker OPEN for {_who(fields)}: "
             f"reason {fields.get('reason', '?')} ({fields.get('source', '?')}) after "
-            f"{_int(fields, 'steps')} steps, spent {format_usd(_int(fields, 'spent'))}. "
+            f"{_after(fields)}, spent {format_usd(_int(fields, 'spent'))}. "
             f"Reset: POST /admin/runs/{run}/reset"
         )
     return f"AgentMeter event {kind}: {dict(fields)}"

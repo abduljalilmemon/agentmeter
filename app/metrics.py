@@ -12,7 +12,8 @@ Proxy (GET /metrics on every replica):
     am_spend_usd_total{agent,team}          USD settled (actual cost), by agent and team
     am_breaker_trips_total{reason}          breaker openings: loop | step_cap (once per
                                             opening, not per refused call)
-    am_proxy_overhead_seconds               time in the proxy, upstream excluded (below)
+    am_proxy_overhead_seconds{outcome}      time in the proxy, upstream excluded (below);
+                                            outcome = forwarded | refused
     am_settle_failures_total                settles that failed (cost not recorded)
     am_requests_total{status,reason,level}  /v1/chat/completions responses; reason and
                                             level are set for 429s (budget/run, loop, ...)
@@ -26,8 +27,10 @@ Worker (its own port, ``worker_metrics_port``):
 has a response to return, minus the time spent waiting for the upstream. For a plain
 call the upstream time is the whole upstream request (send to last body byte); for a
 stream it is the time to the upstream's response headers (``client.send``), and the
-relay of the stream itself is not counted. Calls refused before the upstream (400, 429,
-503) count entirely as overhead. The settle after a stream has ended is not included
+relay of the stream itself is not counted. ``outcome="forwarded"``: the proxy sent the
+call upstream (whatever the upstream then answered, including connection failures).
+``outcome="refused"``: answered without contacting the upstream (400, 429, 503), so
+the whole handler time is overhead. The settle after a stream has ended is not included
 (the client already has every byte by then).
 """
 
@@ -67,6 +70,7 @@ class ProxyMetrics:
         self.overhead = Histogram(
             "am_proxy_overhead_seconds",
             "Time spent in the proxy, upstream time excluded",
+            ["outcome"],
             buckets=OVERHEAD_BUCKETS,
             registry=r,
         )
